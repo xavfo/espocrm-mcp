@@ -1,0 +1,38 @@
+[project]
+name = "espocrm-mcp"
+version = "1.0.0"
+description = "MCP server that exposes EspoCRM REST API as tools for Claude"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Dominik Szymański", email = "dominik@przyszloscjestdzisiaj.pl" },
+]
+keywords = ["espocrm", "mcp", "claude", "crm", "ai"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Office/Business :: Groupware",
+]
+dependencies = [
+  "mcp>=1.0.0",
+  "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/przyszloscjestdzisiaj/espocrm-mcp"
+Repository = "https://github.com/przyszloscjestdzisiaj/espocrm-mcp"
+Issues = "https://github.com/przyszloscjestdzisiaj/espocrm-mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+artifacts = ["server.py"]
