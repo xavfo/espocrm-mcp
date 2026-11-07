@@ -88,6 +88,8 @@ return _req(
 
 **Prueba de aceptación:** desvincular un contacto de una cuenta devuelve `true` y, al consultar `GET /Account/{id}/contacts`, el contacto ya no aparece.
 
+**Estado:** implementado. Cubierto por `tests/test_p0_1_unlink_records.py` (5 casos, offline).
+
 ---
 
 ### P0-2 `upload_attachment`: separar `file` de `attachmentMultiple`
@@ -137,6 +139,8 @@ def upload_attachment(
 
 **Prueba de aceptación:** subir un archivo con `parent_type="Note"` y `field="attachments"` devuelve un `id`; luego `PUT /Note/{id}` con `attachmentsIds: ["<id>"]` lo asocia.
 
+**Estado:** implementado. Cubierto por `tests/test_p0_2_upload_attachment.py` (6 casos, offline).
+
 ---
 
 ### P0-3 `create_note`: `isInternal` de primer nivel
@@ -166,6 +170,8 @@ def create_note(
 ```
 
 **Prueba de aceptación:** crear una nota con `is_internal=True` y verificar en `GET /Note/{id}` que `isInternal` es `true`.
+
+**Estado:** implementado. Cubierto por `tests/test_p0_3_create_note.py` (8 casos, offline).
 
 ---
 
@@ -211,6 +217,16 @@ def get_metadata(scope: str | None = None) -> Any:
 
 **Prueba de aceptación:** con un API user **no admin**, `get_metadata("entityDefs.Account.fields")` devuelve el objeto de campos (200), no 403.
 
+**Estado:** implementado. Cubierto por `tests/test_p0_4_metadata.py` (10 casos, offline) y verificado en vivo.
+
+**Medición en `neo.qsoftware.biz/medic` (7.5.6, usuario `external`, tipo `api`):**
+
+- `GET /Metadata` → `200`, 979 178 bytes, 1,1 s. Claves: `app`, `clientDefs`, `dashlets`, `entityAcl`, `entityDefs`, `fields`, `integrations`, `module`, `scopes`, `streamDefs`, `themes`.
+- `GET /Metadata?key=<cualquiera>` → **`200`, no `403`**, y **ignora la clave**: devuelve el mismo payload completo incluso con `?key=noExiste.ruta`. Es decir, en esta instancia el supuesto del punto de partida no se reproduce.
+- Con caché, la segunda consulta tarda ~0 s. `list_entity_types()` devuelve 179 entidades sobre 194 scopes.
+
+Conclusión: no se debe depender de `?key=` ni por permisos ni por filtrado. Se implementa igual la caché y la navegación local. `get_metadata()` sin `scope` devuelve un índice compacto (`keys`, `scopes`, `hint`) en lugar del documento completo, porque volcar 979 KB en el contexto del LLM inutiliza la herramienta; esto se aparta a propósito del fragmento de código de arriba.
+
 ---
 
 ### P0-5 Errores útiles para el LLM
@@ -247,8 +263,19 @@ def _req(method: str, path: str, **kwargs) -> Any:
 - `409` por duplicado: incluir `data` con los registros duplicados y sugerir `X-Skip-Duplicate-Check: true`.
 - `422`: mostrar los errores por campo.
 - `403`: distinguir “sin permiso de scope” de “campo prohibido”.
+- **Forma real del error (medida en 7.5.6):** un 400 de validación devuelve `{"messageTranslation":{"label":"validationFailure","scope":null,"data":{"field":"pacienteCedula","type":"required"}}}`. **No hay clave `message`**, así que el código propuesto arriba devolvería `message: null`. Hay que leer también `messageTranslation.label` y `messageTranslation.data.field`/`.type`.
 
 **Prueba de aceptación:** crear un `Case` con `type: "Feature Request"` devuelve un error con el `message` de EspoCRM y el detalle de validación.
+
+**Estado:** implementado. Cubierto por `tests/test_p0_5_errors.py` (7 casos, offline) y verificado en vivo:
+
+| Llamada | Respuesta devuelta por el MCP |
+|---|---|
+| `Case` con `type: "Feature Request"` | `{"error": 400, "message": "validationFailure", "data": {"field": "type", "type": "valid"}, "body": {...}}` |
+| `Contact` sin `pacienteCedula` | `{"error": 400, "message": "validationFailure", "data": {"field": "pacienteCedula", "type": "required"}}` |
+| `GET` de un id inexistente | `{"error": 404, "message": "Not Found", "data": null, "body": ""}` |
+
+Pendiente de verificar: el caso `403` que distingue “sin permiso de scope” de “campo prohibido” necesita un rol que prohiba un campo concreto; no se reprodujo en la instancia de prueba. La sugerencia de `X-Skip-Duplicate-Check` para `409` tampoco está verificada en vivo.
 
 ---
 
@@ -266,6 +293,23 @@ def _req(method: str, path: str, **kwargs) -> Any:
 | P1-8 | Timeout, reintentos y logs | `ESPO_TIMEOUT`, reintentos con backoff para `429`/`5xx`, respetar `Retry-After` |
 | P1-9 | Detección de versión | Leer `settings.version` de `App/user` y avisar si no es 7.5.x |
 | P1-10 | Empaquetado | Fijar versiones de `mcp`/`httpx`, añadir `LICENSE` y `.env.example` |
+
+### P1-1 Lista blanca `MCP_ENTITY_ALLOW`
+
+Variable de entorno con nombres de entidad separados por coma. Vacía = sin restricción. Se evalúa en todas las herramientas que nombran una entidad (CRUD, relaciones, stream, notas y adjuntos) **antes** de cualquier request, así que una entidad bloqueada no consume cuota ni deja rastro en el servidor.
+
+```powershell
+$env:MCP_ENTITY_ALLOW = "Account,Contact,Opportunity"
+```
+
+Rechazo devuelto al LLM:
+
+```json
+{"error": "entity_not_allowed", "message": "'Lead' is not in MCP_ENTITY_ALLOW.",
+ "entity": "Lead", "allowed": ["Account", "Contact", "Opportunity"]}
+```
+
+**Estado:** implementado. Cubierto por `tests/test_p1_1_entity_allow.py` (17 casos, incluido uno por herramienta) y verificado en vivo.
 
 ### P1-2 Mapa de reglas sugerido (7.5.6)
 
@@ -318,6 +362,33 @@ ENTITY_RULES = {
 ```
 
 Estas reglas deben usarse como **pistas y validación previa**, no como sustituto del metadata de la instancia. Si un módulo licenciado cambia una opción, el metadata manda.
+
+**Estado:** implementado con esa prioridad — metadata primero, tabla como respaldo.
+
+Lo que se valida antes de enviar, y nada más:
+
+1. **Enums**: si el campo es `enum`/`multiEnum` y el valor no está en `options`, se devuelve la lista de valores válidos.
+2. **Obligatorios al crear**: campos `required` sin `default` que no estén en el payload ni en su forma `{campo}Id`.
+
+Se dejaron fuera a propósito: la lista `no_usar`, porque el servidor acepta esos campos sin error (se comprobó que `Contact.title` y `department` se aceptan), y cualquier validación de formato o patrón, que el servidor ya comunica mejor.
+
+`assignedUser` queda **exento** del control de obligatorios: 7.5.6 lo rellena con el API user cuando el rol prohíbe asignar, así que bloquear por su ausencia daría falsos positivos. Ese caso lo cubre P1-3.
+
+Rechazo devuelto al LLM:
+
+```json
+{"error": "validation_failed", "message": "EspoCRM would reject this Contact payload; nothing was sent.",
+ "entity": "Contact", "problems": [{"field": "pacienteCedula", "type": "required"}]}
+```
+
+**Cubierto por:** `tests/test_p1_2_entity_rules.py` (14 casos). **Verificado en vivo:**
+
+| Payload | Resultado |
+|---|---|
+| `Account` con `tipoIdentificacion: "RUC"` | `invalidOption` con `allowed: ["04","05","06","07","08"]` leído del metadata real |
+| `Contact` sin `pacienteCedula` | `{"field": "pacienteCedula", "type": "required"}` |
+| `Meeting` con solo `name` | `{"field": "dateEnd", "type": "required"}` |
+| `Contact` completo | se crea normalmente (y se borró después) |
 
 ### P1-3 Asignado por defecto
 
@@ -454,6 +525,32 @@ curl -H "X-Api-Key: $KEY" "$ESPO/api/v1/Metadata"
 | `test_metadata_non_admin` | `GET /Metadata` sin `key` → 200; con `key` → 403 |
 | `test_licensed_entity` | crear y listar una entidad de un módulo licenciado |
 
+**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p1_1_entity_allow.py` y `tests/test_p1_2_entity_rules.py` — 67 casos. Se ejecutan con `python -m pytest`.
+
+### 7.3 Verificación contra una instancia real
+
+Ejecutada el 2026-11-06 contra una instancia 7.5.6 con usuario API de tipo `api` (no administrador).
+
+```powershell
+$env:ESPO_URL = "https://<host>/<ruta>"
+$env:ESPO_API_KEY = "<api key>"
+python scripts/live_check.py        # sondas de solo lectura
+python scripts/live_acceptance.py   # P0-1, P0-2 y P0-3 con limpieza automática
+```
+
+**Resultado:** 10/10 verificaciones correctas (versión, vínculo/desvínculo, nota interna persistida y adjunto `attachmentMultiple` asociado). Los cinco registros de prueba (Account, Contact, 2 Note, Attachment) se crearon con marcador `MCPTEST-*` y se eliminaron al finalizar.
+
+Hallazgos de la instancia:
+
+| Hallazgo | Consecuencia |
+|---|---|
+| `Account.tipoIdentificacion` obligatorio, enum `04`–`08`, default `05` | sin él o con otro valor → 400 (`type: "valid"`) |
+| `Contact.pacienteCedula` obligatorio (varchar, máx. 25) | sin él → 400 (`type: "required"`) |
+| `GET /Metadata?key=` responde 200 e ignora la clave | P0-4: no se puede depender de `?key=` |
+| Los errores de validación no traen `message` | P0-5 debe leer `messageTranslation` |
+
+Confirma el riesgo de P1-2: en instancias personalizadas las reglas por entidad hardcodeadas quedan cortas, y el metadata de la instancia es la única fuente confiable.
+
 ---
 
 ## 8. Riesgos y decisiones pendientes
@@ -472,13 +569,13 @@ curl -H "X-Api-Key: $KEY" "$ESPO/api/v1/Metadata"
 
 ## 9. Checklist de entrega
 
-- [ ] P0-1 `unlink_records` con body `ids`.
-- [ ] P0-2 `upload_attachment` con `parentType` para `attachmentMultiple`.
-- [ ] P0-3 `create_note` con `isInternal`.
-- [ ] P0-4 metadata sin admin.
-- [ ] P0-5 errores con `message`/`data`.
-- [ ] P1-1 lista blanca de entidades.
-- [ ] P1-2 reglas por entidad.
+- [x] P0-1 `unlink_records` con body `ids` — probado (`tests/test_p0_1_unlink_records.py`).
+- [x] P0-2 `upload_attachment` con `parentType` para `attachmentMultiple` — probado (`tests/test_p0_2_upload_attachment.py`).
+- [x] P0-3 `create_note` con `isInternal` — probado (`tests/test_p0_3_create_note.py`).
+- [x] P0-4 metadata sin admin — probado (`tests/test_p0_4_metadata.py`) y verificado en vivo.
+- [x] P0-5 errores con `message`/`data` — probado (`tests/test_p0_5_errors.py`) y verificado en vivo.
+- [x] P1-1 lista blanca de entidades — probado (`tests/test_p1_1_entity_allow.py`) y verificado en vivo.
+- [x] P1-2 reglas por entidad — probado (`tests/test_p1_2_entity_rules.py`) y verificado en vivo; metadata primero, tabla como respaldo.
 - [ ] P1-3 asignado por defecto.
 - [ ] P1-4 normalización de fechas.
 - [ ] P1-5–P1-9 límites, `select`, relaciones, timeout/logs y versión.

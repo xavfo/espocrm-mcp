@@ -105,6 +105,28 @@ Restart Claude Code. The `espocrm` MCP server will appear in the tool list.
 
 ---
 
+## Environment variables
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `ESPO_URL` | yes | — | Base URL of the instance, e.g. `https://crm.example.com`. A subdirectory install works: `https://host/espocrm`. |
+| `ESPO_API_KEY` | yes | — | API key of the API user (`Admin → Users → [user] → API Key`). |
+| `MCP_ENTITY_ALLOW` | no | empty | Comma-separated allow-list. When set, every tool rejects entities outside it **before** sending a request. |
+| `ESPO_METADATA_MODE` | no | `frontend` | `frontend` caches `GET /Metadata` and navigates it locally (works for non-admin users). `admin` uses the filtered `?key=` endpoint and requires an administrator. |
+| `MCP_PORT` | no | `8000` | Port used with `--http`. |
+
+Minimal deployment with a restricted surface:
+
+```json
+"env": {
+  "ESPO_URL": "https://crm.example.com",
+  "ESPO_API_KEY": "your-api-key-here",
+  "MCP_ENTITY_ALLOW": "Account,Contact,Opportunity"
+}
+```
+
+---
+
 ## Usage examples
 
 Once connected, you can ask Claude:
