@@ -14,8 +14,8 @@ import pytest
 
 
 def _writes(fake) -> list:
-    """Validation reads metadata; what must not happen is a write going out."""
-    return [r for r in fake.requests if not r.url.path.endswith("/Metadata")]
+    """Validation may read metadata and the profile; no write may go out."""
+    return [r for r in fake.requests if r.method != "GET"]
 
 
 def test_invalid_enum_is_caught_before_the_request(espo, fake):

@@ -55,7 +55,11 @@ METADATA: dict[str, Any] = {
                     "default": "05",
                     "options": ["04", "05", "06", "07", "08"],
                 },
-            }
+            },
+            "links": {
+                "contacts": {"type": "hasMany"},
+                "assignedUser": {"type": "belongsTo"},
+            },
         },
         "Contact": {"fields": {"pacienteCedula": {"type": "varchar", "required": True}}},
         "Task": {
@@ -63,12 +67,16 @@ METADATA: dict[str, Any] = {
                 "name": {"type": "varchar", "required": True},
                 "assignedUser": {"type": "link", "required": True},
                 "parent": {"type": "linkParent", "required": True},
+                "dateStart": {"type": "datetime"},
+                "dateEnd": {"type": "datetimeOptional"},
+                "dueDate": {"type": "date"},
                 "status": {
                     "type": "enum",
                     "default": "Not Started",
                     "options": ["Not Started", "Started", "Completed", "Canceled", "Deferred"],
                 },
-            }
+            },
+            "links": {"parent": {"type": "belongsToParent"}},
         },
     },
     "clientDefs": {"Account": {}},
@@ -87,6 +95,17 @@ class FakeEspo:
         self.metadata: dict[str, Any] = METADATA
         # Mirrors `GET /Metadata?key=` being admin-only on a stock 7.5.6.
         self.metadata_key_forbidden = False
+        # Mirrors `/App/user`: the profile is nested under `user`, next to `acl`.
+        self.current_user: dict[str, Any] = {
+            "user": {"id": "user-1", "userName": "tester", "type": "api"},
+            "settings": {"version": "7.5.6"},
+            "acl": {"assignmentPermission": "all"},
+        }
+        # A role that forbids `assignedUser` makes the server assign by itself.
+        self.forbid_assignment = False
+        # Links whose listing answers 500 on 7.5.6, and links that answer a bare object.
+        self.fail_links: set[tuple[str, str]] = {("Task", "parent")}
+        self.bare_to_one_links: set[tuple[str, str]] = set()
 
     # -- routing ----------------------------------------------------------
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -97,6 +116,8 @@ class FakeEspo:
 
         segments = parts[2:]
         method = request.method
+        if segments == ["App", "user"]:
+            return httpx.Response(200, json=self.current_user)
         if len(segments) == 1:
             if segments[0] == "Metadata":
                 return self._metadata(request, method)
@@ -131,11 +152,24 @@ class FakeEspo:
     def _create_record(
         self, request: httpx.Request, method: str, entity: str
     ) -> httpx.Response:
+        if method == "GET":
+            items = [record for (name, _), record in self.records.items() if name == entity]
+            return httpx.Response(200, json={"list": items, "total": len(items)})
         if method != "POST":
             return httpx.Response(
                 405, json={"message": f"{method} /{entity} is not simulated"}
             )
         body = _body(request)
+        if self.forbid_assignment and "assignedUserId" in body:
+            return httpx.Response(
+                403,
+                json={
+                    "messageTranslation": {
+                        "label": "fieldIsForbidden",
+                        "data": {"field": "assignedUserId"},
+                    }
+                },
+            )
         if entity == "Case" and "type" in body and body["type"] not in CASE_TYPES:
             # The shape real 7.5.6 returns for an invalid enum value (measured live).
             return httpx.Response(
@@ -207,6 +241,10 @@ class FakeEspo:
         return httpx.Response(200, json=True)
 
     def _list_link(self, entity: str, record_id: str, link: str) -> httpx.Response:
+        if (entity, link) in self.fail_links:
+            return httpx.Response(500, json={"message": "Internal Server Error"})
+        if (entity, link) in self.bare_to_one_links:
+            return httpx.Response(200, json={"id": f"{link}-1", "name": "Objeto"})
         ids = self.links.get((entity, record_id, link), [])
         return httpx.Response(
             200, json={"list": [{"id": record} for record in ids], "total": len(ids)}
@@ -242,7 +280,10 @@ def fake() -> FakeEspo:
 def espo(fake: FakeEspo):
     """The `server` module, wired to the simulated instance."""
     server = importlib.import_module("server")
-    server._metadata_cache = None  # module-level cache must not leak between tests
+    server._metadata_cache = None  # module-level caches must not leak between tests
+    server._current_user_cache = None
+    server._version_warned = False
+    server.RETRY_BACKOFF_SECONDS = 0.0  # retries are tested, but never slept on
     server._client = httpx.Client(
         base_url=f"https://crm.test{API_PREFIX}",
         headers={"X-Api-Key": "test-api-key", "Content-Type": "application/json"},

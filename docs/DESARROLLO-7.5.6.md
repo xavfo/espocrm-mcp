@@ -41,7 +41,7 @@ El resto del documento detalla cada cambio, el contrato de compatibilidad con 7.
 |---|---|
 | `GET/POST/PUT/PATCH/DELETE /api/v1/{Entity}` | Rutas genéricas de `application/Espo/Resources/routes.json` |
 | `X-Api-Key` | Cabecera oficial de autenticación por API Key |
-| `where` como JSON string | Documentado en `api-search-params` |
+| `where` **en forma `where[0][type]=...`** | Medido en vivo: la forma JSON string se ignora (ver P0-6) |
 | `select` como lista separada por comas | Documentado en `api/crud` |
 | `maxSize` y `offset` | Documentado en `api-search-params` |
 | `POST /{Entity}/{id}/{link}` con `{"ids": [...]}` | `postActionCreateLink` lee `id` e `ids` |
@@ -279,6 +279,27 @@ Pendiente de verificar: el caso `403` que distingue “sin permiso de scope” d
 
 ---
 
+### P0-6 `where`: enviar el filtro en la forma que EspoCRM lee
+
+**Encontrado durante P1-6**, y de la misma gravedad que los demás P0: `list_records` enviaba el filtro como JSON string, que es la forma que sugiere la documentación de `api-search-params`. **7.5.6 la ignora por completo.**
+
+Medición en vivo:
+
+| Petición | `total` | Registros |
+|---|---|---|
+| `where=[{"type":"equals","attribute":"name","value":"ZZZ_NO_EXISTE"}]` (JSON) | 38 | 5 |
+| `where[0][type]=equals&where[0][attribute]=name&where[0][value]=ZZZ_NO_EXISTE` | **0** | **0** |
+| `where[0][...][value]=KLEVER` (contains) | **2** | **2** |
+| `where[0][attribute]=id` con id real / inexistente | 1 / 0 | 1 / 0 |
+
+Consecuencia: cualquier filtro que pidiera el LLM se descartaba y la herramienta devolvía **todos** los registros, con un `total` que tampoco correspondía a la consulta. Es un fallo silencioso: ni error ni aviso.
+
+**Cambio:** `_where_params` codifica la lista en forma de corchetes, con un nivel por clave (`where[0][value][0][...]` para los grupos `or`/`and`), convierte booleanos a `1`/`0` y no entrecomilla los valores.
+
+**Estado:** implementado. Cubierto por `tests/test_p0_6_where_encoding.py` (10 casos) y verificado en vivo.
+
+---
+
 ## 4. Correcciones recomendadas (P1)
 
 | ID | Mejora | Motivo |
@@ -397,12 +418,122 @@ En 7.5.6, `Record\Service::populateDefaults` asigna el usuario actual **solo si 
 - Si `assignedUserId` no viene en `Meeting`/`Call`/`Task`, consultar `GET /App/user` y usar `user.id`.
 - Documentar que un rol que prohíba asignación hará que EspoCRM use el API user automáticamente.
 
+**Estado:** implementado. El perfil se cachea (`GET /App/user` una sola vez por proceso; el usuario viene anidado en `user`), y la inyección sólo se aplica al crear `Meeting`, `Call` o `Task` sin `assignedUserId` ni `assignedUser`.
+
+Salvaguardas:
+
+- `ESPO_AUTO_ASSIGN=0` desactiva la inyección para roles que prohíben el campo.
+- Si aun así el servidor responde `403` nombrando `assignedUser`, se reintenta **una vez** sin el campo: en un `403` no se creó nada, así que el reintento es seguro. Otros `403` se devuelven tal cual.
+- Si el perfil no se puede leer, se envía el payload original en lugar de fallar.
+
+**Verificado en vivo:** `Meeting` —que antes devolvía `400 assignedUser required`—, `Call` y `Task` se crean correctamente y quedan asignados al usuario API (`external`); los tres se borraron después. En esa instancia `acl.assignmentPermission` es `all` y `fieldTable.Meeting` está vacío, es decir, el rol permite asignar.
+
+**Cubierto por:** `tests/test_p1_3_default_assignee.py` (10 casos).
+
 ### P1-4 Fechas
 
 - Campos `date`: `YYYY-MM-DD`.
 - Campos `datetime`: `YYYY-MM-DD HH:mm:ss` en UTC.
 - Aceptar como entrada `YYYY-MM-DDTHH:mm:ss`, `YYYY-MM-DDTHH:mm:ssZ` y convertirlos antes de enviar.
 - En `Meeting` y `Call`, `dateStart`/`dateEnd` son obligatorios.
+
+**Medición en vivo (`scripts/probe_dates.py`):**
+
+| Entrada | Respuesta del servidor |
+|---|---|
+| `2026-12-01 10:00:00` | `200`, se guarda igual → se interpreta como **UTC** |
+| `2026-12-01T10:00:00` | `400 {"field": "dateStart", "type": "valid"}` |
+| `2026-12-01T10:00:00Z` | `400` ídem |
+| `2026-12-01T10:00:00-05:00` | `400` ídem |
+| `2026-12-01T10:00:00+00:00` | `400` ídem |
+
+Además, el tipo real de `Meeting.dateStart`/`dateEnd` en 7.5.6 es **`datetimeOptional`**, no `datetime`: una primera versión que sólo miraba `datetime` dejaba pasar la cadena ISO y el servidor respondía 400.
+
+**Estado:** implementado. La zona de trabajo es **América/Guayaquil (UTC-5)** fija, no la del sistema: Ecuador no aplica horario de verano desde 1993, así que un desplazamiento constante es exacto y no depende de la base IANA (que Python en Windows no trae). Se puede cambiar con `ESPO_UTC_OFFSET`.
+
+Reglas aplicadas al **escribir** (`create_record` y `update_record`):
+
+- Campo de tipo `datetime`/`datetimeOptional` y valor **sin** desplazamiento → se lee como hora de Guayaquil y se envía en UTC (10:00 local → `15:00:00`).
+- Con desplazamiento explícito (`Z`, `-05:00`, `+02:00`) → se respeta y se convierte a UTC.
+- Campos `date` y valores no interpretables → intactos; el servidor explica el error.
+- Sin metadata disponible sólo se normalizan `dateStart`/`dateEnd`; un campo `datetime` propio no se toca, para no desplazarlo por conjetura.
+
+**Decisión:** la normalización es sólo de entrada. Las lecturas (`get_record`, `list_records`) devuelven lo que manda EspoCRM, en UTC. Convertirlas a UTC-5 obligaría a reinterpretar cada respuesta y haría que los valores leídos no coincidan con los filtros enviados; si se necesita, es una entrega aparte.
+
+**Verificado en vivo:** `dateStart: "2026-12-01 10:00:00"` se guarda como `2026-12-01 15:00:00`, y `dateEnd: "2026-12-01T11:00:00-05:00"` como `2026-12-01 16:00:00`. El registro se borró después.
+
+**Cubierto por:** `tests/test_p1_4_dates.py` (14 casos).
+
+### P1-5 Límite de paginación
+
+`max_size` se acota a **200** en `list_records`, `list_related` y `get_stream`. No se rechaza la llamada: se devuelve la página acotada y la respuesta lo dice, para que el llamador sepa que pidió más de lo que recibió.
+
+```json
+{"list": [...], "total": 38,
+ "pageSizeCapped": {"requested": 5000, "applied": 200, "max": 200}}
+```
+
+Un `max_size` de 0 o negativo sube a 1. La marca no se añade a las respuestas de error.
+
+**Estado:** implementado. `tests/test_p1_5_pagination.py` (7 casos), verificado en vivo (`max_size=5000` → `applied: 200`).
+
+### P1-6 `select` en lectura
+
+`select` añadido a `get_record` y `list_related`; `list_records` ya lo tenía. Medición en vivo:
+
+- `GET /Account` (listado) **respeta** `select` y añade solo unos campos automáticos (`id`, `createdAt`, `createdById`, `assignedUserId`).
+- `GET /Account/{id}?select=id,name` **lo ignora**: devolvió los 58 campos del registro. Probado también con `attributeSelect`, con el mismo resultado.
+- `GET /Account/{id}/contacts?select=...` **sí lo respeta**.
+
+Por eso `get_record` con `select` no usa el endpoint de registro único: consulta el listado filtrando por `id` (`maxSize=1`) y devuelve la fila. Si no hay coincidencia devuelve un `404` explícito en lugar de un registro ajeno.
+
+Resultado medido: **5 campos en vez de 58**.
+
+**Estado:** implementado. `tests/test_p1_6_select.py` (7 casos) y verificado en vivo.
+
+### P1-7 Relaciones `to-one`
+
+El supuesto de esta ficha — que `GET /{Entity}/{id}/{link}` devuelve un objeto y no `{list}` — **no se cumple en 7.5.6**. Medición en vivo:
+
+| Enlace | Tipo | Respuesta |
+|---|---|---|
+| `Account/{id}/assignedUser` | `belongsTo` | `{"total": 1, "list": [...]}` |
+| `Account/{id}/originalLead` | `hasOne` | `{"total": 0, "list": []}` |
+| `Task/{id}/parent` | `belongsToParent` | **`500 Internal Server Error`** (en las tres tareas probadas) |
+
+No hay nada que “normalizar” en cuanto a forma: el sobre ya es uniforme. Lo que sí está roto es `belongsToParent`, y ahí se interviene:
+
+- Si el enlace es `belongsToParent` según el metadata y el servidor falla con `5xx`, se lee el registro, se toman `parentType`/`parentId` y se devuelve `{"total": 1, "list": [<padre>], "resolvedVia": "parentId"}`. Sin padre: `{"total": 0, "list": []}`.
+- Si un servidor devolviera un objeto suelto en un enlace `to-one`, se envuelve en el sobre. Es defensivo, no una corrección de lo observado.
+- Un `5xx` en un enlace `to-many` se devuelve tal cual: no se redirige nada que no corresponda.
+
+**Estado:** implementado. `tests/test_p1_7_links.py` (7 casos) y verificado en vivo (`Task/{id}/parent` ahora devuelve el contacto padre).
+
+### P1-8 Timeout, reintentos y logs
+
+| Variable | Default | Efecto |
+|---|---|---|
+| `ESPO_TIMEOUT` | `30` | Timeout por petición, en segundos. |
+| `ESPO_MAX_RETRIES` | `2` | Reintentos adicionales. |
+| `ESPO_RETRY_BACKOFF` | `0.5` | Base del retroceso exponencial. |
+| `ESPO_LOG_LEVEL` | `INFO` | Nivel del registro. |
+
+Política de reintentos, deliberadamente conservadora:
+
+- **`429` se reintenta siempre**, respetando `Retry-After` cuando viene. Un `429` significa que la petición fue rechazada, así que repetirla no duplica nada.
+- **`5xx` y errores de transporte sólo en `GET`**. Un `POST` que falla con `500` pudo haber creado el registro: duplicar una cita médica es peor que mostrar el error.
+
+Trazabilidad: una línea por petición con método, ruta, estado y duración. Va a **stderr**, porque con transporte `stdio` el stdout es el protocolo MCP. La API key no aparece nunca: sólo se registra la ruta.
+
+**Estado:** implementado. `tests/test_p1_8_resilience.py` (9 casos, con el retroceso a cero para no dormir en CI).
+
+### P1-9 Detección de versión
+
+`get_current_user` añade un bloque `compatibility` calculado desde `settings.version` de `GET /App/user`, y si la versión no empieza por `7.5.` se registra **un solo aviso**. No se bloquea nada: la instancia se sigue usando.
+
+**Verificado en vivo:** `{"version": "7.5.6", "expected": "7.5.x", "compatible": true}`.
+
+**Estado:** implementado. `tests/test_p1_9_version.py` (5 casos).
 
 ---
 
@@ -525,7 +656,7 @@ curl -H "X-Api-Key: $KEY" "$ESPO/api/v1/Metadata"
 | `test_metadata_non_admin` | `GET /Metadata` sin `key` → 200; con `key` → 403 |
 | `test_licensed_entity` | crear y listar una entidad de un módulo licenciado |
 
-**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p1_1_entity_allow.py` y `tests/test_p1_2_entity_rules.py` — 67 casos. Se ejecutan con `python -m pytest`.
+**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p0_6_where_encoding.py`, `tests/test_p1_1_entity_allow.py`, `tests/test_p1_2_entity_rules.py`, `tests/test_p1_3_default_assignee.py`, `tests/test_p1_4_dates.py`, `tests/test_p1_5_pagination.py`, `tests/test_p1_6_select.py`, `tests/test_p1_7_links.py`, `tests/test_p1_8_resilience.py` y `tests/test_p1_9_version.py` — 135 casos. Se ejecutan con `python -m pytest`.
 
 ### 7.3 Verificación contra una instancia real
 
@@ -574,15 +705,133 @@ Confirma el riesgo de P1-2: en instancias personalizadas las reglas por entidad 
 - [x] P0-3 `create_note` con `isInternal` — probado (`tests/test_p0_3_create_note.py`).
 - [x] P0-4 metadata sin admin — probado (`tests/test_p0_4_metadata.py`) y verificado en vivo.
 - [x] P0-5 errores con `message`/`data` — probado (`tests/test_p0_5_errors.py`) y verificado en vivo.
+- [x] P0-6 `where` en forma de corchetes — probado (`tests/test_p0_6_where_encoding.py`) y verificado en vivo.
 - [x] P1-1 lista blanca de entidades — probado (`tests/test_p1_1_entity_allow.py`) y verificado en vivo.
 - [x] P1-2 reglas por entidad — probado (`tests/test_p1_2_entity_rules.py`) y verificado en vivo; metadata primero, tabla como respaldo.
-- [ ] P1-3 asignado por defecto.
-- [ ] P1-4 normalización de fechas.
-- [ ] P1-5–P1-9 límites, `select`, relaciones, timeout/logs y versión.
-- [ ] P1-10 empaquetado y `LICENSE`.
-- [ ] Pruebas de contrato contra 7.5.6.
-- [ ] README actualizado con las particularidades de 7.5.6.
-- [ ] `CHANGELOG.md` y versión `0.2.0`.
+- [x] P1-3 asignado por defecto — probado (`tests/test_p1_3_default_assignee.py`) y verificado en vivo.
+- [x] P1-4 normalización de fechas — probado (`tests/test_p1_4_dates.py`) y verificado en vivo (zona fija UTC-5, América/Guayaquil).
+- [x] P1-5 límite de paginación — probado (`tests/test_p1_5_pagination.py`) y verificado en vivo.
+- [x] P1-6 `select` en `get_record` y `list_related` — probado (`tests/test_p1_6_select.py`) y verificado en vivo.
+- [x] P1-7 relaciones `to-one` — probado (`tests/test_p1_7_links.py`) y verificado en vivo; `belongsToParent` resuelto por `parentType`/`parentId`.
+- [x] P1-8 timeout, reintentos y logs — probado (`tests/test_p1_8_resilience.py`).
+- [x] P1-9 detección de versión — probado (`tests/test_p1_9_version.py`) y verificado en vivo.
+- [x] P1-10 empaquetado y `LICENSE` — versiones acotadas, `.env.example`, rueda verificada (solo `server.py`).
+- [x] Pruebas de contrato contra 7.5.6 — `scripts/live_acceptance.py` 10/10, más verificaciones puntuales por cada P0/P1.
+- [x] README actualizado con las variables de entorno; las particularidades de 7.5.6 están en §2–§4 y §10.
+- [x] `CHANGELOG.md` y versión `0.2.0`.
+- [x] Instrucciones de instalación en §10.
+
+---
+
+## 10. Instalación y puesta en marcha
+
+### 10.1 Requisitos
+
+- Python 3.10 o superior (probado con 3.14 en Windows).
+- EspoCRM 7.5.x. Otra versión no se bloquea, pero el servidor avisa (P1-9) y las particularidades documentadas pueden no aplicar.
+- Un usuario de API y su clave. **No hace falta administrador**: nada de lo que hace este servidor lo requiere.
+- Permisos del rol suficientes para las entidades que se vayan a usar (lectura y escritura).
+
+### 10.2 Instalar
+
+```powershell
+git clone https://github.com/<usuario>/espocrm-mcp.git
+cd espocrm-mcp
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+```
+
+- Con `uv`: `uv sync --extra dev`.
+- El extra `dev` sólo añade `pytest`. Para ejecutar el servidor basta `pip install -e .`.
+- El paquete **no está publicado en PyPI** a la fecha de esta entrega: se instala desde el repositorio.
+
+### 10.3 Configurar las credenciales
+
+El servidor lee **variables de entorno**, no un archivo `.env`. `.env.example` sirve como plantilla de qué variables existen; los valores se pasan en el bloque `env` del cliente MCP o en la sesión de PowerShell:
+
+```powershell
+$env:ESPO_URL = "https://crm.example.com"
+$env:ESPO_API_KEY = "<api key>"
+```
+
+Si faltan `ESPO_URL` o `ESPO_API_KEY`, el servidor termina con código 1 y un mensaje en stderr.
+
+### 10.4 Registrar el servidor en el cliente MCP
+
+En Claude Code (`~/.claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "espocrm": {
+      "command": "uv",
+      "args": ["run", "--directory", "C:/ruta/a/espocrm-mcp", "python", "server.py"],
+      "env": {
+        "ESPO_URL": "https://crm.example.com",
+        "ESPO_API_KEY": "<api key>",
+        "MCP_ENTITY_ALLOW": "Account,Contact,Opportunity"
+      }
+    }
+  }
+}
+```
+
+Sin `uv`, usa `"command": "python"` con la ruta absoluta a `server.py` como único argumento. El nombre de la clave raíz (`mcpServers`, `servers`) depende del cliente; los argumentos y el bloque `env` son iguales en todos.
+
+Transporte HTTP opcional: `python server.py --http` (puerto en `MCP_PORT`, 8000 por defecto).
+
+### 10.5 Comprobar que quedó bien
+
+```powershell
+python scripts/live_check.py        # solo lectura: versión, permisos y metadata
+python -m pytest                    # 135 casos, sin instancia real
+python scripts/live_acceptance.py   # crea y borra registros de prueba
+```
+
+Resultados esperados:
+
+| Comprobación | Esperado |
+|---|---|
+| `live_check.py` | `version=7.5.6` en `App/user`; 200 en `Metadata`, `Settings` y `Account` |
+| `pytest` | `135 passed` |
+| `live_acceptance.py` | `10/10 verificaciones correctas` y los registros `MCPTEST-*` eliminados |
+
+`live_acceptance.py` **escribe** en el CRM: crea una cuenta, un contacto, dos notas y un adjunto con el prefijo `MCPTEST-`, y los borra en un bloque `finally`. Si el proceso se interrumpe, esos registros quedan en el CRM y hay que borrarlos a mano.
+
+### 10.6 Variables de entorno
+
+| Variable | Requerida | Default | Para qué |
+|---|---|---|---|
+| `ESPO_URL` | sí | — | URL base, con subdirectorio si la instalación lo usa. |
+| `ESPO_API_KEY` | sí | — | Clave del usuario de API. |
+| `MCP_ENTITY_ALLOW` | no | vacío | Lista blanca de entidades (P1-1). |
+| `ESPO_METADATA_MODE` | no | `frontend` | `frontend` cachea `/Metadata`; `admin` usa `?key=` (requiere administrador). |
+| `ESPO_AUTO_ASSIGN` | no | `1` | Asigna `Meeting`/`Call`/`Task` al usuario de API (P1-3). |
+| `ESPO_UTC_OFFSET` | no | `-5` | Zona de trabajo para convertir fechas a UTC (P1-4). |
+| `ESPO_TIMEOUT` | no | `30` | Timeout por petición, en segundos. |
+| `ESPO_MAX_RETRIES` | no | `2` | Reintentos de `429` y, sólo en lecturas, de `5xx`. |
+| `ESPO_RETRY_BACKOFF` | no | `0.5` | Base del retroceso exponencial. |
+| `ESPO_LOG_LEVEL` | no | `INFO` | Nivel de traza (stderr). |
+| `MCP_PORT` | no | `8000` | Puerto con `--http`. |
+
+### 10.7 Si algo no funciona
+
+| Síntoma | Causa probable |
+|---|---|
+| El proceso termina con código 1 | Falta `ESPO_URL` o `ESPO_API_KEY`. |
+| `401` | Clave incorrecta o usuario inactivo. |
+| `403` al leer una entidad | El rol del usuario de API no tiene ese scope. |
+| `400` con `message: validationFailure` | Mira `data.field` y `data.type`: el campo concreto y el motivo. |
+| `error: entity_not_allowed` | La entidad no está en `MCP_ENTITY_ALLOW`. |
+| Aviso “EspoCRM X detected” | La instancia no es 7.5.x; sigue funcionando, pero revisa §5. |
+| `select` no acota la respuesta | Estás leyendo con `get_record` sin `select`, o la instancia ignora `select` en lectura individual (P1-6). |
+
+### 10.8 Limitaciones conocidas
+
+- La rueda publica `server.py` como módulo **global** `server`. Para publicar en PyPI conviene moverlo a un paquete (`espocrm_mcp/`), que es un cambio de estructura pendiente.
+- Las lecturas devuelven las fechas en UTC; sólo se normaliza la escritura (§P1-4).
+- `GET /{Entity}/{id}?select=` se ignora en 7.5.6, y `belongsToParent` no se puede listar: ambos casos tienen rodeo implementado y documentado.
 
 ---
 

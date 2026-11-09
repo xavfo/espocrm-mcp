@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """EspoCRM MCP server — exposes EspoCRM REST API as MCP tools for Claude."""
 import json
+import logging
 import os
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -13,6 +16,10 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 ESPO_URL = os.environ.get("ESPO_URL", "").rstrip("/")
 ESPO_API_KEY = os.environ.get("ESPO_API_KEY", "")
+ESPO_TIMEOUT = float(os.environ.get("ESPO_TIMEOUT", "30"))
+ESPO_MAX_RETRIES = int(os.environ.get("ESPO_MAX_RETRIES", "2"))
+# Tests set this to 0; a real deployment wants a pause between attempts.
+RETRY_BACKOFF_SECONDS = float(os.environ.get("ESPO_RETRY_BACKOFF", "0.5"))
 
 if not ESPO_URL or not ESPO_API_KEY:
     print(
@@ -27,23 +34,89 @@ if not ESPO_URL or not ESPO_API_KEY:
 # ---------------------------------------------------------------------------
 mcp = FastMCP("espocrm", port=int(os.environ.get("MCP_PORT", "8000")))
 
+# stderr on purpose: stdout carries the MCP protocol when the transport is stdio.
+logger = logging.getLogger("espocrm")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.environ.get("ESPO_LOG_LEVEL", "INFO").upper())
+
 _client = httpx.Client(
     base_url=f"{ESPO_URL}/api/v1",
     headers={"X-Api-Key": ESPO_API_KEY, "Content-Type": "application/json"},
-    timeout=30.0,
+    timeout=ESPO_TIMEOUT,
 )
+
+# 429 means the request was refused, so retrying is always safe. A 5xx on a write may
+# have created the record, so only GETs are retried there.
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    """Honour `Retry-After` when present, otherwise back off exponentially."""
+    if response is not None:
+        header = response.headers.get("Retry-After")
+        if header:
+            try:
+                return max(0.0, float(header))
+            except ValueError:
+                pass
+    return RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
 
 
 def _req(method: str, path: str, **kwargs) -> Any:
-    r = _client.request(method, path, **kwargs)
-    if r.status_code >= 400:
-        return _error_result(r)
-    if not r.text:
+    """Call the API, logging method, route, status and duration — never the key.
+
+    Retries `429` always and `5xx`/transport failures only for `GET`: a failed write
+    may already have created the record, and duplicating a patient's appointment is
+    worse than surfacing the error.
+    """
+    attempt = 0
+    while True:
+        started = time.perf_counter()
+        try:
+            response = _client.request(method, path, **kwargs)
+        except httpx.TransportError as exc:
+            if method == "GET" and attempt < ESPO_MAX_RETRIES:
+                attempt += 1
+                logger.warning(
+                    "%s %s transport error (%s), retry %d/%d",
+                    method, path, type(exc).__name__, attempt, ESPO_MAX_RETRIES,
+                )
+                time.sleep(_retry_delay(None, attempt))
+                continue
+            logger.error("%s %s failed: %s", method, path, exc)
+            return {"error": "transport", "message": str(exc), "path": path}
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info("%s %s -> %s (%.0f ms)", method, path, response.status_code, elapsed_ms)
+
+        retryable = response.status_code in RETRYABLE_STATUSES and (
+            response.status_code == 429 or method == "GET"
+        )
+        if retryable and attempt < ESPO_MAX_RETRIES:
+            attempt += 1
+            delay = _retry_delay(response, attempt)
+            logger.warning(
+                "%s %s -> %s, retry %d/%d in %.2fs",
+                method, path, response.status_code, attempt, ESPO_MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
+            continue
+
+        return _decode(response)
+
+
+def _decode(response: httpx.Response) -> Any:
+    if response.status_code >= 400:
+        return _error_result(response)
+    if not response.text:
         return {"ok": True}
     try:
-        return r.json()
+        return response.json()
     except Exception:
-        return {"raw": r.text[:2000]}
+        return {"raw": response.text[:2000]}
 
 
 def _error_result(response: httpx.Response) -> dict[str, Any]:
@@ -145,8 +218,178 @@ ENTITY_RULES: dict[str, dict[str, Any]] = {
 }
 
 # 7.5.6 fills `assignedUser` with the API user when the role forbids assigning, so
-# a missing value is not necessarily a 400. P1-3 will handle the rest.
+# a missing value is not necessarily a 400. The server does *not* fill it when the
+# role allows assigning (measured: `Meeting` without it answers 400
+# `{"field": "assignedUser", "type": "required"}`), so P1-3 injects the API user.
 REQUIRED_EXEMPT = {"assignedUser", "assignedUserId"}
+
+AUTO_ASSIGN_ENTITIES = {"Meeting", "Call", "Task"}
+AUTO_ASSIGN = os.environ.get("ESPO_AUTO_ASSIGN", "1").lower() not in {"0", "false", "no"}
+
+_current_user_cache: dict[str, Any] | None = None
+
+
+def _current_user() -> dict[str, Any]:
+    """The API user's profile from `GET /App/user`, fetched once per process.
+
+    The payload nests the profile under `user` (alongside `acl`, `settings` and
+    `preferences`), which is not obvious and was the first thing that broke here.
+    """
+    global _current_user_cache
+    if _current_user_cache is None:
+        data = _req("GET", "/App/user")
+        if not isinstance(data, dict) or not isinstance(data.get("user"), dict):
+            return {}  # do not cache failures
+        _current_user_cache = data["user"]
+    return _current_user_cache
+
+
+def _with_default_assignee(entity: str, data: Any) -> Any:
+    """Assign new `Meeting`/`Call`/`Task` records to the API user when nobody is set."""
+    if not AUTO_ASSIGN or entity not in AUTO_ASSIGN_ENTITIES or not isinstance(data, dict):
+        return data
+    if "assignedUserId" in data or "assignedUser" in data:
+        return data
+    user_id = _current_user().get("id")
+    return {**data, "assignedUserId": user_id} if user_id else data
+
+
+def _assignment_forbidden(result: Any) -> bool:
+    """True when the server rejected the payload because of `assignedUser`."""
+    if not isinstance(result, dict) or result.get("error") != 403:
+        return False
+    return "assignedUser" in json.dumps(result.get("body"), ensure_ascii=False)
+
+
+def _create_entity(entity: str, data: Any) -> Any:
+    """POST a record, retrying without the injected assignee if the role forbids it.
+
+    A role that forbids the field makes the server assign the API user itself; our
+    explicit value would be rejected. Nothing is created on a 403, so retrying is
+    safe.
+    """
+    result = _req("POST", f"/{entity}", json=data)
+    if isinstance(data, dict) and "assignedUserId" in data and _assignment_forbidden(result):
+        return _req(
+            "POST",
+            f"/{entity}",
+            json={k: v for k, v in data.items() if k != "assignedUserId"},
+        )
+    return result
+
+
+# America/Guayaquil is UTC-05:00 all year round: Ecuador dropped DST after 1993, so a
+# fixed offset is exact here and avoids the IANA database, which stock Windows Python
+# does not ship. Override with ESPO_UTC_OFFSET if a deployment needs another zone.
+UTC_OFFSET_HOURS = float(os.environ.get("ESPO_UTC_OFFSET", "-5"))
+INSTANCE_TZ = timezone(timedelta(hours=UTC_OFFSET_HOURS))
+
+# Used only when the metadata cannot say which fields are datetime-typed.
+DATETIME_FALLBACK_FIELDS = {"dateStart", "dateEnd"}
+
+
+def _to_utc_string(value: Any) -> Any:
+    """Render a caller-supplied datetime the only way 7.5.6 accepts it.
+
+    Measured live: `2026-12-01T10:00:00`, `...Z` and `...-05:00` all answer 400
+    `{"field": "dateStart", "type": "valid"}`; only `YYYY-MM-DD HH:mm:ss` works.
+    A value without an offset is read as local time in the instance's zone (UTC-5 by
+    default) and shifted to UTC, which is what the UI expects — sending it untouched
+    would show the event five hours early.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return value  # let the server explain what is wrong with it
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=INSTANCE_TZ)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_dates(entity: str, data: Any) -> Any:
+    """Convert datetime-typed fields to UTC; `date` fields are left alone.
+
+    The field type comes from the instance's metadata, and 7.5.6 uses two names for
+    it: `datetime` and `datetimeOptional` (measured live — `Meeting.dateStart` and
+    `dateEnd` are the latter, which is why matching only `datetime` silently let the
+    raw ISO string through). Anything else is left untouched. Without metadata only
+    the well-known event fields are normalised, so a custom datetime field passes
+    through rather than being shifted by guesswork.
+    """
+    if not isinstance(data, dict):
+        return data
+    fields = _entity_fields(entity)
+    normalized = dict(data)
+    for name, value in data.items():
+        definition = fields.get(name)
+        field_type = definition.get("type") if isinstance(definition, dict) else None
+        is_datetime = isinstance(field_type, str) and field_type.startswith("datetime")
+        if not is_datetime and not (
+            field_type is None and name in DATETIME_FALLBACK_FIELDS
+        ):
+            continue
+        normalized[name] = _to_utc_string(value)
+    return normalized
+
+
+# A single call cannot return more than this; over-sized requests are clamped rather
+# than rejected, and the response says so. 200 keeps one page inside a sane context
+# budget while still being useful.
+MAX_PAGE_SIZE = 200
+
+
+def _page_size(max_size: Any) -> tuple[int, dict[str, Any] | None]:
+    """Clamp `max_size` to a usable range and describe the clamp when it applies."""
+    try:
+        requested = int(max_size)
+    except (TypeError, ValueError):
+        requested = 50
+    applied = max(1, min(requested, MAX_PAGE_SIZE))
+    note = None
+    if applied != requested:
+        note = {"requested": requested, "applied": applied, "max": MAX_PAGE_SIZE}
+    return applied, note
+
+
+def _with_page_note(result: Any, note: dict[str, Any] | None) -> Any:
+    """Tell the caller the page was capped, without touching error payloads."""
+    if note and isinstance(result, dict) and "error" not in result:
+        return {**result, "pageSizeCapped": note}
+    return result
+
+
+def _encode_where(prefix: str, value: Any, params: dict[str, str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _encode_where(f"{prefix}[{key}]", item, params)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _encode_where(f"{prefix}[{index}]", item, params)
+    elif value is None:
+        return
+    elif isinstance(value, bool):
+        params[prefix] = "1" if value else "0"
+    else:
+        params[prefix] = str(value)
+
+
+def _where_params(where: Any) -> dict[str, str]:
+    """Encode a filter list the way EspoCRM actually reads it.
+
+    7.5.6 builds `where` from the query as a PHP array. The documented JSON-string
+    form is *silently ignored*: measured live, filtering on a non-existent name still
+    returned all 38 accounts and an unchanged `total`. The bracketed query form
+    (`where[0][type]=...`) filters correctly, including by `id`.
+
+    Nested groups are encoded one level at a time, so `{"type": "or", "value": [...]}`
+    becomes `where[0][value][0][...]`.
+    """
+    params: dict[str, str] = {}
+    if isinstance(where, list) and where:
+        _encode_where("where", where, params)
+    return params
 
 
 def _entity_guard(entity: str) -> dict[str, Any] | None:
@@ -168,6 +411,79 @@ def _entity_fields(entity: str) -> dict[str, Any]:
         return {}
     fields = _navigate(md, f"entityDefs.{entity}.fields")
     return fields if isinstance(fields, dict) else {}
+
+
+# Link types that address a single record. Measured live: 7.5.6 answers with the same
+# `{total, list}` envelope for `belongsTo` and `hasOne`, but `belongsToParent` fails.
+LINK_TO_ONE_TYPES = {"belongsTo", "hasOne", "belongsToParent"}
+LINK_FAILURE_STATUSES = {500, 501, 502, 503, 504}
+
+
+def _link_type(entity: str, link: str) -> str | None:
+    """The `type` of a relationship link according to the instance's metadata."""
+    md = _fetch_metadata()
+    if not isinstance(md, dict) or "error" in md:
+        return None
+    links = _navigate(md, f"entityDefs.{entity}.links")
+    if not isinstance(links, dict):
+        return None
+    definition = links.get(link)
+    return definition.get("type") if isinstance(definition, dict) else None
+
+
+def _normalize_link_payload(result: Any, link_type: str | None) -> Any:
+    """Give a to-one link the same `{total, list}` shape as a to-many one.
+
+    The note in the guide claims a to-one link returns a bare object; on the instance
+    it returns the same envelope, so this only rewrites what an instance might still
+    send — a defensive normalisation, not a correction of observed behaviour.
+    """
+    if link_type not in LINK_TO_ONE_TYPES:
+        return result
+    if isinstance(result, dict) and "error" not in result and "list" not in result:
+        return {"total": 0, "list": []} if not result else {"total": 1, "list": [result]}
+    return result
+
+
+def _resolve_parent(entity: str, record_id: str, select: str | None = None) -> Any:
+    """Read a `belongsToParent` link through its `parentType`/`parentId` fields.
+
+    Listing that link answers 500 Internal Server Error on 7.5.6 (measured on every
+    Task tried), while the parent record itself is perfectly readable.
+    """
+    record = _req("GET", f"/{entity}/{record_id}")
+    if not isinstance(record, dict) or "error" in record:
+        return record
+    parent_type, parent_id = record.get("parentType"), record.get("parentId")
+    if not parent_type or not parent_id:
+        return {"total": 0, "list": [], "resolvedVia": "parentId"}
+    params = {"select": select} if select else None
+    parent = _req("GET", f"/{parent_type}/{parent_id}", params=params)
+    if isinstance(parent, dict) and "error" in parent:
+        return parent
+    return {"total": 1, "list": [parent], "resolvedVia": "parentId"}
+
+
+# The server targets one major line; anything else is still allowed but announced.
+EXPECTED_VERSION_PREFIX = "7.5."
+_version_warned = False
+
+
+def _compatibility(version: Any) -> dict[str, Any]:
+    """Describe whether the instance matches the version this server was written for."""
+    global _version_warned
+    text = str(version or "")
+    compatible = text.startswith(EXPECTED_VERSION_PREFIX)
+    if text and not compatible and not _version_warned:
+        logger.warning(
+            "EspoCRM %s detected; this server targets %sx", text, EXPECTED_VERSION_PREFIX
+        )
+        _version_warned = True
+    return {
+        "version": text or None,
+        "expected": f"{EXPECTED_VERSION_PREFIX}x",
+        "compatible": compatible,
+    }
 
 
 def _required_fields(entity: str, fields: dict[str, Any], rules: dict[str, Any]) -> list[str]:
@@ -260,7 +576,7 @@ def list_records(
         order_by: Field name to sort by.
         order:    Sort direction — "asc" or "desc".
         offset:   Pagination offset.
-        max_size: Maximum number of records to return (default 50).
+        max_size: Maximum number of records to return (default 50, capped at 200).
     """
     params: dict[str, Any] = {"offset": offset, "maxSize": max_size, "order": order}
     if order_by:
@@ -268,25 +584,56 @@ def list_records(
     if select:
         params["select"] = select
     if where:
-        params["where"] = json.dumps(where)
+        params.update(_where_params(where))
     denied = _entity_guard(entity)
     if denied:
         return denied
-    return _req("GET", f"/{entity}", params=params)
+    page_size, note = _page_size(max_size)
+    params["maxSize"] = page_size
+    return _with_page_note(_req("GET", f"/{entity}", params=params), note)
 
 
 @mcp.tool()
-def get_record(entity: str, record_id: str) -> Any:
+def get_record(entity: str, record_id: str, select: str | None = None) -> Any:
     """Fetch a single record by its ID.
 
     Args:
         entity:    EspoCRM entity name.
         record_id: Record ID.
+        select:    Comma-separated list of fields to return, to avoid huge payloads.
     """
     denied = _entity_guard(entity)
     if denied:
         return denied
+    if select:
+        return _read_selected(entity, record_id, select)
     return _req("GET", f"/{entity}/{record_id}")
+
+
+def _read_selected(entity: str, record_id: str, select: str) -> Any:
+    """Read one record carrying only the requested fields.
+
+    7.5.6 ignores `select` on `GET /{Entity}/{id}` (measured live: `?select=id,name`
+    still returned all 58 fields), while the list endpoint honours it. So the request
+    goes through the collection with a filter on `id` and the single row is unwrapped,
+    which keeps the return shape the caller expects.
+    """
+    where = [{"type": "equals", "attribute": "id", "value": record_id}]
+    result = _req(
+        "GET",
+        f"/{entity}",
+        params={"select": select, "maxSize": 1, **_where_params(where)},
+    )
+    if isinstance(result, dict) and "error" in result:
+        return result
+    rows = result.get("list") if isinstance(result, dict) else None
+    if not rows:
+        return {
+            "error": 404,
+            "message": f"{entity} {record_id} not found.",
+            "data": {"id": record_id},
+        }
+    return rows[0]
 
 
 @mcp.tool()
@@ -300,10 +647,12 @@ def create_record(entity: str, data: dict) -> Any:
     denied = _entity_guard(entity)
     if denied:
         return denied
+    data = _normalize_dates(entity, data)
+    data = _with_default_assignee(entity, data)
     invalid = _validate_payload(entity, data, creating=True)
     if invalid:
         return invalid
-    return _req("POST", f"/{entity}", json=data)
+    return _create_entity(entity, data)
 
 
 @mcp.tool()
@@ -318,6 +667,7 @@ def update_record(entity: str, record_id: str, data: dict) -> Any:
     denied = _entity_guard(entity)
     if denied:
         return denied
+    data = _normalize_dates(entity, data)
     invalid = _validate_payload(entity, data, creating=False)
     if invalid:
         return invalid
@@ -347,6 +697,7 @@ def list_related(
     entity: str,
     record_id: str,
     link: str,
+    select: str | None = None,
     max_size: int = 50,
     offset: int = 0,
 ) -> Any:
@@ -356,17 +707,27 @@ def list_related(
         entity:    EspoCRM entity name, e.g. Account.
         record_id: Parent record ID.
         link:      Relationship link name, e.g. "contacts", "opportunities".
-        max_size:  Maximum number of records to return.
+        select:    Comma-separated list of fields to return, to avoid huge payloads.
+        max_size:  Maximum number of records to return (capped at 200).
         offset:    Pagination offset.
     """
     denied = _entity_guard(entity)
     if denied:
         return denied
-    return _req(
-        "GET",
-        f"/{entity}/{record_id}/{link}",
-        params={"maxSize": max_size, "offset": offset},
-    )
+    page_size, note = _page_size(max_size)
+    params: dict[str, Any] = {"maxSize": page_size, "offset": offset}
+    if select:
+        params["select"] = select
+    link_type = _link_type(entity, link)
+    result = _req("GET", f"/{entity}/{record_id}/{link}", params=params)
+    if (
+        link_type == "belongsToParent"
+        and isinstance(result, dict)
+        and result.get("error") in LINK_FAILURE_STATUSES
+    ):
+        # 7.5.6 cannot list that link; the parent is still reachable through its fields.
+        result = _resolve_parent(entity, record_id, select)
+    return _with_page_note(_normalize_link_payload(result, link_type), note)
 
 
 @mcp.tool()
@@ -422,7 +783,7 @@ def get_stream(
         entity:    Entity name (required when fetching a record stream, e.g. "Account").
         record_id: Record ID (required when fetching a record stream).
         offset:    Pagination offset.
-        max_size:  Maximum number of stream entries to return.
+        max_size:  Maximum number of stream entries to return (capped at 200).
     """
     if bool(entity) != bool(record_id):
         return {"error": "Provide both entity and record_id, or neither for the global stream."}
@@ -430,8 +791,11 @@ def get_stream(
         denied = _entity_guard(entity)
         if denied:
             return denied
+    page_size, note = _page_size(max_size)
     path = f"/{entity}/{record_id}/stream" if entity else "/Stream"
-    return _req("GET", path, params={"offset": offset, "maxSize": max_size})
+    return _with_page_note(
+        _req("GET", path, params={"offset": offset, "maxSize": page_size}), note
+    )
 
 
 @mcp.tool()
@@ -651,8 +1015,16 @@ def get_metadata(scope: str | None = None) -> Any:
 
 @mcp.tool()
 def get_current_user() -> Any:
-    """Return the profile and permissions of the currently authenticated API user."""
-    return _req("GET", "/App/user")
+    """Return the profile and permissions of the currently authenticated API user.
+
+    Includes a `compatibility` block: this server targets 7.5.x, so an instance on a
+    different version is reported instead of failing in obscure ways later.
+    """
+    data = _req("GET", "/App/user")
+    if not isinstance(data, dict) or "error" in data:
+        return data
+    settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+    return {**data, "compatibility": _compatibility(settings.get("version"))}
 
 
 @mcp.tool()

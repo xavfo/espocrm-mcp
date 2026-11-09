@@ -112,6 +112,11 @@ Restart Claude Code. The `espocrm` MCP server will appear in the tool list.
 | `ESPO_URL` | yes | — | Base URL of the instance, e.g. `https://crm.example.com`. A subdirectory install works: `https://host/espocrm`. |
 | `ESPO_API_KEY` | yes | — | API key of the API user (`Admin → Users → [user] → API Key`). |
 | `MCP_ENTITY_ALLOW` | no | empty | Comma-separated allow-list. When set, every tool rejects entities outside it **before** sending a request. |
+| `ESPO_AUTO_ASSIGN` | no | `1` | Assign new `Meeting`/`Call`/`Task` records to the API user when no assignee is given. Set `0` if the role forbids the field. |
+| `ESPO_UTC_OFFSET` | no | `-5` | Working offset used to convert datetimes to UTC (America/Guayaquil is UTC-5 year-round). |
+| `ESPO_TIMEOUT` | no | `30` | Per-request timeout in seconds. |
+| `ESPO_MAX_RETRIES` | no | `2` | Retries for `429` and, on reads only, `5xx`/transport errors. |
+| `ESPO_LOG_LEVEL` | no | `INFO` | Log level; lines go to stderr, never including the API key. |
 | `ESPO_METADATA_MODE` | no | `frontend` | `frontend` caches `GET /Metadata` and navigates it locally (works for non-admin users). `admin` uses the filtered `?key=` endpoint and requires an administrator. |
 | `MCP_PORT` | no | `8000` | Port used with `--http`. |
 
@@ -124,6 +129,28 @@ Minimal deployment with a restricted surface:
   "MCP_ENTITY_ALLOW": "Account,Contact,Opportunity"
 }
 ```
+
+---
+
+## Development
+
+```powershell
+pip install -e ".[dev]"      # or: uv sync --extra dev
+python -m pytest             # 135 tests against a simulated EspoCRM 7.5.6
+```
+
+The suite needs no EspoCRM instance: `tests/conftest.py` swaps the HTTP client for a
+simulator that reproduces the 7.5.6 quirks. These scripts do talk to a real instance,
+and `live_acceptance.py` writes (and deletes) records tagged `MCPTEST-*`:
+
+```powershell
+python scripts/live_check.py        # read-only probes
+python scripts/live_acceptance.py   # end-to-end, cleans up after itself
+```
+
+Detailed installation steps, the measured 7.5.6 behaviour and every adaptation made
+are in [`docs/DESARROLLO-7.5.6.md`](docs/DESARROLLO-7.5.6.md); §10 is the
+installation guide.
 
 ---
 
