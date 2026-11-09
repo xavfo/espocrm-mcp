@@ -4,7 +4,11 @@ Todas las fechas en formato AAAA-MM-DD. El proyecto sigue versionado semántico
 mientras la versión sea `0.x`: la API de las herramientas puede cambiar entre
 versiones menores.
 
-## [0.2.0] — 2026-11-09
+## [1.0.1] — 2026-11-09
+
+El paquete pasa a llamarse **`espocrm-mcp7`** para poder convivir con el
+`espocrm-mcp` original, y la versión continúa la línea del upstream (1.0.0) en lugar
+de empezar de cero: es un fork que mantiene una versión concreta de EspoCRM.
 
 Adaptación de la base 1.0.0 para **EspoCRM 7.5.6**, verificada contra una instancia
 real (incluidos módulos y campos personalizados).
@@ -56,6 +60,8 @@ real (incluidos módulos y campos personalizados).
 
 ### Empaquetado
 
+- Nombre del paquete: `espocrm-mcp7`; versión `1.0.1`.
+- Sólo se publica `server.py`: la rueda ya no arrastra tests, scripts ni docs.
 - Versiones de `mcp` y `httpx` acotadas; `LICENSE` (MIT) y `.env.example`.
 
-[0.2.0]: https://github.com/przyszloscjestdzisiaj/espocrm-mcp/releases/tag/v0.2.0
+[1.0.1]: https://github.com/xavfo/espocrm-mcp/releases/tag/v1.0.1

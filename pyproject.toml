@@ -1,7 +1,7 @@
 [project]
-name = "espocrm-mcp"
-version = "0.2.0"
-description = "MCP server exposing the EspoCRM REST API as tools, adapted and verified against EspoCRM 7.5.6"
+name = "espocrm-mcp7"
+version = "1.0.1"
+description = "MCP server exposing the EspoCRM REST API as tools, forked and verified against EspoCRM 7.5.x"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -29,9 +29,9 @@ dependencies = [
 dev = ["pytest>=8.0"]
 
 [project.urls]
-Homepage = "https://github.com/przyszloscjestdzisiaj/espocrm-mcp"
-Repository = "https://github.com/przyszloscjestdzisiaj/espocrm-mcp"
-Issues = "https://github.com/przyszloscjestdzisiaj/espocrm-mcp/issues"
+Homepage = "https://github.com/xavfo/espocrm-mcp"
+Repository = "https://github.com/xavfo/espocrm-mcp"
+Issues = "https://github.com/xavfo/espocrm-mcp/issues"
 
 [build-system]
 requires = ["hatchling"]

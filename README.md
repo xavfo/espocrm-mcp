@@ -1,6 +1,8 @@
-# espocrm-mcp
+# espocrm-mcp7
 
-MCP server that exposes the [EspoCRM](https://www.espocrm.com/) REST API as tools for [Claude](https://claude.ai/code).
+MCP server that exposes the [EspoCRM](https://www.espocrm.com/) REST API as tools for Claude.
+
+Fork of [`espocrm-mcp`](https://github.com/przyszloscjestdzisiaj/espocrm-mcp) adapted and verified against **EspoCRM 7.5.x**. The package is published as `espocrm-mcp7` so it can coexist with the upstream one; the module is still `server.py`.
 
 Connect any EspoCRM instance to Claude and manage records, relationships, attachments, and the activity stream — all through natural language.
 
@@ -66,7 +68,7 @@ Connect any EspoCRM instance to Claude and manage records, relationships, attach
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/przyszloscjestdzisiaj/espocrm-mcp.git
+git clone https://github.com/xavfo/espocrm-mcp.git
 cd espocrm-mcp
 ```
 

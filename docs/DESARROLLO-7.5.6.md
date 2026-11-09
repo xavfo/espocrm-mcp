@@ -1,7 +1,8 @@
-# Desarrollo de `espocrm-mcp` para EspoCRM 7.5.6
+# Desarrollo de `espocrm-mcp7` para EspoCRM 7.5.6
 
 **Estado:** propuesto
 **Base elegida:** `espocrm-mcp` (`server.py` único, licencia MIT)
+**Nombre del paquete:** `espocrm-mcp7`, versión `1.0.1` (fork que sostiene la línea 7.5.x)
 **Objetivo:** que el MCP funcione de forma estable contra EspoCRM **7.5.6**, incluidos los módulos licenciados que agregan entidades y campos personalizados.
 **Referencia técnica:** código fuente de `espocrm/espocrm`, etiqueta `7.5.6`, y documentación oficial de la API.
 **Fecha:** 2026-11-06
@@ -718,7 +719,7 @@ Confirma el riesgo de P1-2: en instancias personalizadas las reglas por entidad 
 - [x] P1-10 empaquetado y `LICENSE` — versiones acotadas, `.env.example`, rueda verificada (solo `server.py`).
 - [x] Pruebas de contrato contra 7.5.6 — `scripts/live_acceptance.py` 10/10, más verificaciones puntuales por cada P0/P1.
 - [x] README actualizado con las variables de entorno; las particularidades de 7.5.6 están en §2–§4 y §10.
-- [x] `CHANGELOG.md` y versión `0.2.0`.
+- [x] `CHANGELOG.md` y versión `1.0.1` (paquete `espocrm-mcp7`).
 - [x] Instrucciones de instalación en §10.
 
 ---
@@ -735,7 +736,7 @@ Confirma el riesgo de P1-2: en instancias personalizadas las reglas por entidad 
 ### 10.2 Instalar
 
 ```powershell
-git clone https://github.com/<usuario>/espocrm-mcp.git
+git clone https://github.com/xavfo/espocrm-mcp.git
 cd espocrm-mcp
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
