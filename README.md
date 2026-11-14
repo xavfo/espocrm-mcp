@@ -117,6 +117,39 @@ Replace `/path/to/espocrm-mcp` with the absolute path to the cloned directory.
 
 Restart Claude Code. The `espocrm` MCP server will appear in the tool list.
 
+### 5. Consume it from Visual Studio Code
+
+The repository ships `.vscode/mcp.json`, which starts `scripts/start_mcp.py`. That
+script reads the credentials from `.env` (git-ignored), so the API key never lives in
+a versioned file.
+
+The first time, create the `.env` from a terminal in the project folder:
+
+```powershell
+python scripts/start_mcp.py --setup
+```
+
+It asks for `ESPO_URL` and `ESPO_API_KEY` (the key is not echoed), normalises
+`crm.example.com` to `https://crm.example.com`, and writes `.env` with owner-only
+permissions on Linux/macOS. Re-run the same command to change them later.
+
+Then open the folder in VS Code, run **MCP: List Servers → espocrm → Start** (the
+editor also shows a **Start** button above `mcp.json`) and check the tool picker in
+Copilot Chat, agent mode. It needs GitHub Copilot Chat; MCP tools are only offered in
+agent mode.
+
+Notes:
+
+- If the server is started from VS Code without a `.env`, it **fails fast** (exit 2)
+  with the exact command to run instead of waiting on stdin, which would hang the
+  MCP client. The message shows up in **Output → MCP**.
+- The script prefers `.venv` (Windows `Scripts` or POSIX `bin`) and falls back to the
+  interpreter VS Code launched it with. `ESPO_PYTHON` forces a specific one.
+- `python scripts/start_mcp.py --http` starts the HTTP transport instead of stdio;
+  use `"type": "http", "url": "http://127.0.0.1:8000/mcp"` in that case.
+- Process environment variables win over `.env`, so a temporary override in the
+  terminal works as usual.
+
 ---
 
 ## Environment variables
@@ -150,7 +183,7 @@ Minimal deployment with a restricted surface:
 
 ```powershell
 pip install -e ".[dev]"      # or: uv sync --extra dev
-python -m pytest             # 165 tests against a simulated EspoCRM 7.5.6
+python -m pytest             # 183 tests against a simulated EspoCRM 7.5.6
 ```
 
 The suite needs no EspoCRM instance: `tests/conftest.py` swaps the HTTP client for a

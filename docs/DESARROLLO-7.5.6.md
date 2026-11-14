@@ -657,7 +657,7 @@ curl -H "X-Api-Key: $KEY" "$ESPO/api/v1/Metadata"
 | `test_metadata_non_admin` | `GET /Metadata` sin `key` → 200; con `key` → 403 |
 | `test_licensed_entity` | crear y listar una entidad de un módulo licenciado |
 
-**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p0_6_where_encoding.py`, `tests/test_p1_1_entity_allow.py`, `tests/test_p1_2_entity_rules.py`, `tests/test_p1_3_default_assignee.py`, `tests/test_p1_4_dates.py`, `tests/test_p1_5_pagination.py`, `tests/test_p1_6_select.py`, `tests/test_p1_7_links.py`, `tests/test_p1_8_resilience.py`, `tests/test_p1_9_version.py` y `tests/test_p2_1_qmedic_catalog.py` — 165 casos. Se ejecutan con `python -m pytest`.
+**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p0_6_where_encoding.py`, `tests/test_p1_1_entity_allow.py`, `tests/test_p1_2_entity_rules.py`, `tests/test_p1_3_default_assignee.py`, `tests/test_p1_4_dates.py`, `tests/test_p1_5_pagination.py`, `tests/test_p1_6_select.py`, `tests/test_p1_7_links.py`, `tests/test_p1_8_resilience.py`, `tests/test_p1_9_version.py`, `tests/test_p2_1_qmedic_catalog.py` y `tests/test_p2_2_start_script.py` — 183 casos. Se ejecutan con `python -m pytest`.
 
 ### 7.3 Verificación contra una instancia real
 
@@ -718,6 +718,7 @@ Confirma el riesgo de P1-2: en instancias personalizadas las reglas por entidad 
 - [x] P1-9 detección de versión — probado (`tests/test_p1_9_version.py`) y verificado en vivo.
 - [x] P1-10 empaquetado y `LICENSE` — versiones acotadas, `.env.example`, rueda verificada (`server.py` y `qmedic_catalog.py`).
 - [x] P2-1 catálogo de entidades de QMedic — probado (`tests/test_p2_1_qmedic_catalog.py`, 30 casos) y regenerable con `--check`.
+- [x] P2-2 arranque desde VS Code con `.env` — `.vscode/mcp.json`, `scripts/start_mcp.py` y 18 casos en `tests/test_p2_2_start_script.py`.
 - [x] Pruebas de contrato contra 7.5.6 — `scripts/live_acceptance.py` 10/10, más verificaciones puntuales por cada P0/P1.
 - [x] README actualizado con las variables de entorno; las particularidades de 7.5.6 están en §2–§4 y §10.
 - [x] `CHANGELOG.md` y versión `1.0.1` (paquete `espocrm-mcp7`).
@@ -781,13 +782,28 @@ En Claude Code (`~/.claude/settings.json`):
 
 Sin `uv`, usa `"command": "python"` con la ruta absoluta a `server.py` como único argumento. El nombre de la clave raíz (`mcpServers`, `servers`) depende del cliente; los argumentos y el bloque `env` son iguales en todos.
 
+**Visual Studio Code:** el repo incluye `.vscode/mcp.json`, que arranca
+`scripts/start_mcp.py` en vez de `server.py`. El script saca las credenciales de
+`.env` (ignorado por git, así la API key no queda en un archivo versionado),
+prefiere el intérprete de `.venv`, comprueba que `mcp` y `httpx` se puedan importar
+y reenvía `--http` si se le pasa:
+
+```powershell
+python scripts/start_mcp.py --setup   # pregunta ESPO_URL y ESPO_API_KEY una vez
+```
+
+Si VS Code arranca el servidor sin `.env`, el script **no se queda esperando** en
+stdin (eso colgaría el cliente MCP): termina con código 2 y deja el mensaje en
+**Output → MCP**. `ESPO_PYTHON` fuerza un intérprete concreto; el entorno del proceso
+tiene prioridad sobre `.env`.
+
 Transporte HTTP opcional: `python server.py --http` (puerto en `MCP_PORT`, 8000 por defecto).
 
 ### 10.5 Comprobar que quedó bien
 
 ```powershell
 python scripts/live_check.py        # solo lectura: versión, permisos y metadata
-python -m pytest                    # 165 casos, sin instancia real
+python -m pytest                    # 183 casos, sin instancia real
 python scripts/live_acceptance.py   # crea y borra registros de prueba
 ```
 
@@ -796,7 +812,7 @@ Resultados esperados:
 | Comprobación | Esperado |
 |---|---|
 | `live_check.py` | `version=7.5.6` en `App/user`; 200 en `Metadata`, `Settings` y `Account` |
-| `pytest` | `165 passed` |
+| `pytest` | `183 passed` |
 | `live_acceptance.py` | `10/10 verificaciones correctas` y los registros `MCPTEST-*` eliminados |
 
 `live_acceptance.py` **escribe** en el CRM: crea una cuenta, un contacto, dos notas y un adjunto con el prefijo `MCPTEST-`, y los borra en un bloque `finally`. Si el proceso se interrumpe, esos registros quedan en el CRM y hay que borrarlos a mano.

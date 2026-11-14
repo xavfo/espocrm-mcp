@@ -26,6 +26,12 @@ el metadata completo.
 - **`scripts/generate_qmedic_catalog.py`** con `--check`, para regenerar el catálogo
   cuando cambie QMedic y fallar si el archivo versionado quedó viejo. Ruta
   configurable con `QMEDIC_METADATA`.
+- **Arranque desde Visual Studio Code**: `.vscode/mcp.json` y
+  `scripts/start_mcp.py`. El script carga `.env` (no versionado), lo crea
+  preguntando `ESPO_URL` y `ESPO_API_KEY` (`--setup`), normaliza la URL, prefiere el
+  intérprete de `.venv`, comprueba que `mcp` y `httpx` se importen y, lanzado sin
+  terminal desde el cliente MCP, termina con código 2 y un mensaje accionable en
+  lugar de quedarse esperando en stdin.
 
 ### Cambiado
 
@@ -41,11 +47,14 @@ el metadata completo.
 
 ### Pruebas
 
-- 30 pruebas nuevas (`tests/test_p2_1_qmedic_catalog.py`): integridad del catálogo,
+- 30 pruebas del catálogo (`tests/test_p2_1_qmedic_catalog.py`): integridad,
   herramienta por herramienta, validación y fechas desde el catálogo, enlaces
   múltiples en forma `Ids`, y comparación del archivo versionado contra el metadata
   real de QMedic (se omite si no está).
-- Total: **165 pruebas**.
+- 18 pruebas del arranque (`tests/test_p2_2_start_script.py`): lectura del `.env`,
+  validación, preguntas sin eco, escritura sin CRLF, precedencia del entorno, fallo
+  rápido sin terminal y el propio `mcp.json`.
+- Total: **183 pruebas**.
 
 ## [1.0.1] — 2026-11-09
 

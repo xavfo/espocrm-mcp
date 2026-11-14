@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "espocrm": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["${workspaceFolder}/scripts/start_mcp.py"]
+    }
+  }
+}
