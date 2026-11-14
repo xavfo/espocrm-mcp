@@ -4,6 +4,10 @@ MCP server that exposes the [EspoCRM](https://www.espocrm.com/) REST API as tool
 
 Fork of [`espocrm-mcp`](https://github.com/przyszloscjestdzisiaj/espocrm-mcp) adapted and verified against **EspoCRM 7.5.x**. The package is published as `espocrm-mcp7` so it can coexist with the upstream one; the module is still `server.py`.
 
+Ships a generated catalog of the **141 entities QMedic** defines (clinical history,
+vital signs, prescriptions, billing, inventory, FHIR, WhatsApp), so the model does not
+have to download the ~1 MB metadata or guess names such as `Atencion`.
+
 Connect any EspoCRM instance to Claude and manage records, relationships, attachments, and the activity stream — all through natural language.
 
 ---
@@ -52,6 +56,14 @@ Connect any EspoCRM instance to Claude and manage records, relationships, attach
 | `get_metadata` | Fetch EspoCRM metadata (full or scoped, e.g. `entityDefs.Account`) |
 | `get_current_user` | Return the profile and permissions of the current API user |
 | `get_translations` | Return UI labels and translations |
+
+### QMedic
+
+| Tool | Description |
+|------|-------------|
+| `list_qmedic_entities` | List QMedic's entities by functional group (`clinico`, `facturacion`, `fhir`…), with label, mandatory fields and a workflow hint |
+| `describe_entity` | Describe one entity: mandatory fields, closed options, datetime fields and domain links. Reads live metadata and falls back to the QMedic catalog |
+| `get_patient_summary` | Read a patient's head record plus their last atenciones, signos vitales, recetas, certificados and resultados in a single call |
 
 ---
 
@@ -138,7 +150,7 @@ Minimal deployment with a restricted surface:
 
 ```powershell
 pip install -e ".[dev]"      # or: uv sync --extra dev
-python -m pytest             # 135 tests against a simulated EspoCRM 7.5.6
+python -m pytest             # 165 tests against a simulated EspoCRM 7.5.6
 ```
 
 The suite needs no EspoCRM instance: `tests/conftest.py` swaps the HTTP client for a
@@ -152,7 +164,49 @@ python scripts/live_acceptance.py   # end-to-end, cleans up after itself
 
 Detailed installation steps, the measured 7.5.6 behaviour and every adaptation made
 are in [`docs/DESARROLLO-7.5.6.md`](docs/DESARROLLO-7.5.6.md); §10 is the
-installation guide.
+installation guide and §11 covers the QMedic catalog.
+
+---
+
+## QMedic entities
+
+QMedic is EspoCRM plus 141 custom entities. The generic CRUD tools already reach all
+of them; what was missing was knowing *which* ones exist, what they are called in the
+UI and which fields they demand. `qmedic_catalog.py` answers that offline.
+
+| Group | What it covers |
+|-------|----------------|
+| `clinico` | Patient (`Contact`), `Atencion`, `SignosVitales`, diagnoses, certificates, consents |
+| `especialidad` | Optometry, dentistry, nutrition, mental health, vaccines, obstetrics |
+| `recetas` | `Receta` / `RecetaProducto` and the alternate prescription model |
+| `facturacion` | Invoices, quotes, prices, taxes, payments |
+| `inventario` | Products, suppliers, stock movements |
+| `contabilidad` | Chart of accounts (`ChartClass` → `ChartTypes` → `ChartMaster`), journals |
+| `comercial` | Accounts, agreements, insurers, branches |
+| `comunicaciones` | WhatsApp messaging |
+| `fhir` | FHIR mapping engine |
+| `actividad` | Meetings (`Meeting` is labelled «Consulta»), calls, tasks |
+| `administracion` | Users, teams, employees, reports |
+
+Typical flow for a clinical request:
+
+```text
+get_patient_summary(contact_id)      -> patient head + last records per section
+describe_entity("Atencion")          -> mandatory fields, enums, links, datetimes
+list_records("Atencion", where=[…])  -> filter by pacienteId, estado, fechaIngreso…
+```
+
+The catalog is **generated**, never edited by hand. Regenerate it whenever QMedic's
+metadata changes, and `--check` fails if the committed copy is stale:
+
+```powershell
+python scripts/generate_qmedic_catalog.py            # rewrite qmedic_catalog.py
+python scripts/generate_qmedic_catalog.py --check    # CI-style verification
+```
+
+It reads `custom/Espo/Custom/Resources` from a sibling `qmedic-v4` checkout by
+default; set `QMEDIC_METADATA` to point elsewhere. The instance's live metadata always
+wins over the catalog: the catalog is a map, not an authority.
 
 ---
 
@@ -162,11 +216,15 @@ Once connected, you can ask Claude:
 
 > "Show me all open opportunities over $10k"
 
+> "What did we do for patient 0102030405 in their last visit?"
+
 > "Create a task for Acme account: follow up on the proposal, due next Friday"
 
 > "Add a note to the John Smith contact: called to discuss renewal, very interested"
 
 > "List all contacts at Acme Corp with their email addresses"
+
+> "Which fields does an Atencion require, and what values does `estado` accept?"
 
 > "What's in the activity stream for deal ID abc123?"
 

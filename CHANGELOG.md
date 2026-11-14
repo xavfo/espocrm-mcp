@@ -4,6 +4,49 @@ Todas las fechas en formato AAAA-MM-DD. El proyecto sigue versionado semántico
 mientras la versión sea `0.x`: la API de las herramientas puede cambiar entre
 versiones menores.
 
+## [1.1.0] — 2026-11-13
+
+Soporte de las **141 entidades que define QMedic** sobre EspoCRM. Las herramientas
+CRUD ya las alcanzaban; lo que faltaba era un mapa para descubrirlas sin descargar
+el metadata completo.
+
+### Añadido
+
+- **`qmedic_catalog.py`**: catálogo generado desde el metadata de QMedic con etiqueta
+  de interfaz, grupo funcional, campos obligatorios, opciones cerradas, campos de
+  fecha y hora y enlaces de dominio de cada entidad.
+- **`list_qmedic_entities`**: lista las entidades por grupo (`clinico`, `facturacion`,
+  `fhir`…), con el flujo recomendado para cada uno y filtro por nombre o etiqueta.
+- **`describe_entity`**: ficha de una entidad con obligatorios, enums, fechas y
+  enlaces. Usa el metadata vivo y, si no responde, el catálogo, indicándolo en
+  `source`. En modo compacto sólo muestra lo necesario para escribir un payload.
+- **`get_patient_summary`**: cabeza del paciente más los últimos registros de
+  `atenciones`, `signosVitales`, `recetas`, `certificados` y `resultados` en una sola
+  llamada de sólo lectura.
+- **`scripts/generate_qmedic_catalog.py`** con `--check`, para regenerar el catálogo
+  cuando cambie QMedic y fallar si el archivo versionado quedó viejo. Ruta
+  configurable con `QMEDIC_METADATA`.
+
+### Cambiado
+
+- **Validación previa ampliada**: `ENTITY_RULES` se completa con los obligatorios y
+  enums del catálogo, así que un enum fuera de rango o un campo obligatorio ausente
+  se detectan incluso si `GET /Metadata` falla. El metadata de la instancia sigue
+  teniendo prioridad.
+- **Fechas**: sin metadata, los campos `datetime` del catálogo se convierten a UTC
+  (antes sólo `dateStart`/`dateEnd`); `Atencion.fechaIngreso` ya no se envía como
+  hora local sin convertir.
+- **Empaquetado**: la rueda incluye `qmedic_catalog.py` además de `server.py`;
+  versión `1.1.0`.
+
+### Pruebas
+
+- 30 pruebas nuevas (`tests/test_p2_1_qmedic_catalog.py`): integridad del catálogo,
+  herramienta por herramienta, validación y fechas desde el catálogo, enlaces
+  múltiples en forma `Ids`, y comparación del archivo versionado contra el metadata
+  real de QMedic (se omite si no está).
+- Total: **165 pruebas**.
+
 ## [1.0.1] — 2026-11-09
 
 El paquete pasa a llamarse **`espocrm-mcp7`** para poder convivir con el

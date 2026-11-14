@@ -1,14 +1,14 @@
 [project]
 name = "espocrm-mcp7"
-version = "1.0.1"
-description = "MCP server exposing the EspoCRM REST API as tools, forked and verified against EspoCRM 7.5.x"
+version = "1.1.0"
+description = "MCP server exposing the EspoCRM REST API as tools, forked and verified against EspoCRM 7.5.x, with a catalog of QMedic's clinical entities"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [
   { name = "Dominik Szymański", email = "dominik@przyszloscjestdzisiaj.pl" },
 ]
-keywords = ["espocrm", "mcp", "claude", "crm", "ai", "7.5.6"]
+keywords = ["espocrm", "mcp", "claude", "crm", "ai", "7.5.6", "qmedic", "ehr"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -38,9 +38,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# Only the server module ships: tests, scripts and docs stay in the repository.
-# Verified by building the wheel and listing its contents.
-only-include = ["server.py"]
+# Only the server module and the generated catalog ship: tests, scripts and docs stay
+# in the repository. Verified by building the wheel and listing its contents.
+only-include = ["server.py", "qmedic_catalog.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

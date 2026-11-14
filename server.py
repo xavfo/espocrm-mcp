@@ -11,6 +11,14 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from qmedic_catalog import (
+    QMEDIC_ENTITIES,
+    QMEDIC_GROUPS,
+    QMEDIC_WORKFLOW,
+    describe_catalog_entry,
+    entities_in_group,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -217,6 +225,18 @@ ENTITY_RULES: dict[str, dict[str, Any]] = {
     },
 }
 
+# QMedic defines over 140 entities of its own (clinical, billing, FHIR, WhatsApp...).
+# The catalog supplies their mandatory fields and closed options so pre-validation
+# keeps working when `GET /Metadata` fails or the entity is not in the cached
+# metadata yet. It does not replace the instance: `_required_fields` and
+# `_validate_payload` always prefer what the metadata says.
+for _entity_name, _catalog_entry in QMEDIC_ENTITIES.items():
+    _rules = ENTITY_RULES.setdefault(_entity_name, {})
+    if _catalog_entry.get("required"):
+        _rules.setdefault("required", list(_catalog_entry["required"]))
+    for _field_name, _options in (_catalog_entry.get("enums") or {}).items():
+        _rules.setdefault("enums", {}).setdefault(_field_name, list(_options))
+
 # 7.5.6 fills `assignedUser` with the API user when the role forbids assigning, so
 # a missing value is not necessarily a 400. The server does *not* fill it when the
 # role allows assigning (measured: `Meeting` without it answers 400
@@ -314,21 +334,25 @@ def _normalize_dates(entity: str, data: Any) -> Any:
     The field type comes from the instance's metadata, and 7.5.6 uses two names for
     it: `datetime` and `datetimeOptional` (measured live — `Meeting.dateStart` and
     `dateEnd` are the latter, which is why matching only `datetime` silently let the
-    raw ISO string through). Anything else is left untouched. Without metadata only
-    the well-known event fields are normalised, so a custom datetime field passes
-    through rather than being shifted by guesswork.
+    raw ISO string through). Anything else is left untouched. Without metadata the
+    well-known event fields and the QMedic catalog's datetime fields are normalised,
+    so a QMedic date does not silently pass through unconverted.
     """
     if not isinstance(data, dict):
         return data
     fields = _entity_fields(entity)
+    # Without metadata, the QMedic catalog knows which fields are datetimes in this
+    # project (e.g. `Atencion.fechaIngreso`), so the UTC conversion does not depend
+    # on `GET /Metadata` succeeding.
+    fallback = DATETIME_FALLBACK_FIELDS | set(
+        (QMEDIC_ENTITIES.get(entity) or {}).get("datetimes") or ()
+    )
     normalized = dict(data)
     for name, value in data.items():
         definition = fields.get(name)
         field_type = definition.get("type") if isinstance(definition, dict) else None
         is_datetime = isinstance(field_type, str) and field_type.startswith("datetime")
-        if not is_datetime and not (
-            field_type is None and name in DATETIME_FALLBACK_FIELDS
-        ):
+        if not is_datetime and not (field_type is None and name in fallback):
             continue
         normalized[name] = _to_utc_string(value)
     return normalized
@@ -540,15 +564,26 @@ def _validate_payload(
             if name not in REQUIRED_EXEMPT
             and name not in data
             and f"{name}Id" not in data
+            # A linkMultiple is sent as `{field}Ids`, not as `{field}Id`.
+            and f"{name}Ids" not in data
         ]
         problems.extend({"field": name, "type": "required"} for name in missing)
 
     if not problems:
         return None
+    # Say where the rules came from: a catalog-based rejection on an instance whose
+    # metadata did not answer is a hint, not a measurement.
+    if fields:
+        source = "metadata"
+    elif entity in QMEDIC_ENTITIES:
+        source = "catalog"
+    else:
+        source = "builtin"
     return {
         "error": "validation_failed",
         "message": f"EspoCRM would reject this {entity} payload; nothing was sent.",
         "entity": entity,
+        "rulesSource": source,
         "problems": problems,
     }
 
@@ -1007,6 +1042,304 @@ def get_metadata(scope: str | None = None) -> Any:
     if value is None:
         return {"error": "scope not found", "scope": scope, "keys": sorted(md)}
     return value
+
+
+# ---------------------------------------------------------------------------
+# QMedic catalog tools
+# ---------------------------------------------------------------------------
+# The CRUD tools already reach any entity; what was missing was knowing which ones
+# exist in QMedic, what they are called in the UI and which fields they demand. The
+# catalog is static (generated from the project's metadata) and live metadata wins
+# whenever it is available.
+
+def _field_summary(definition: Any) -> dict[str, Any]:
+    """What a caller needs to know about a field to build a valid payload."""
+    if not isinstance(definition, dict):
+        return {}
+    item: dict[str, Any] = {}
+    for key in ("type", "required", "readOnly", "default"):
+        if definition.get(key) not in (None, False):
+            item[key] = definition[key]
+    options = definition.get("options")
+    if isinstance(options, list) and options:
+        item["options"] = options
+    return item
+
+
+def _entity_links(definition: Any) -> dict[str, str]:
+    """Domain links: name -> target entity, without EspoCRM's own plumbing."""
+    links = definition.get("links") if isinstance(definition, dict) else None
+    if not isinstance(links, dict):
+        return {}
+    result: dict[str, str] = {}
+    for name, link in links.items():
+        if name in ("createdBy", "modifiedBy", "assignedUser", "teams"):
+            continue
+        target = link.get("entity") if isinstance(link, dict) else None
+        if isinstance(target, str) and target:
+            result[name] = target
+    return result
+
+
+@mcp.tool()
+def list_qmedic_entities(group: str | None = None, query: str | None = None) -> Any:
+    """List the entities QMedic defines, grouped by functional area.
+
+    QMedic ships 141 entities on top of EspoCRM. Without this map the model has to
+    download the ~1 MB metadata or guess names like `Atencion`, `SignosVitales` or
+    `RecetaProducto`. Each group also carries a one-paragraph workflow hint saying
+    where to start reading.
+
+    Args:
+        group: Optional group key, e.g. "clinico", "facturacion", "comunicaciones".
+        query: Optional case-insensitive filter on entity name or UI label.
+    """
+    if group and group not in QMEDIC_GROUPS:
+        return {
+            "error": "unknown_group",
+            "message": f"'{group}' is not a QMedic group.",
+            "groups": sorted(QMEDIC_GROUPS),
+        }
+
+    names = entities_in_group(group) if group else sorted(QMEDIC_ENTITIES)
+    if query:
+        needle = query.casefold()
+        names = [
+            name
+            for name in names
+            if needle in name.casefold()
+            or needle in str(QMEDIC_ENTITIES[name].get("label", name)).casefold()
+        ]
+
+    entries = []
+    for name in names:
+        entry = QMEDIC_ENTITIES[name]
+        item: dict[str, Any] = {"entity": name, "label": entry.get("label", name)}
+        if not group:
+            item["group"] = entry.get("group")
+        if entry.get("required"):
+            item["required"] = entry["required"]
+        if entry.get("status"):
+            item["status"] = entry["status"]
+        entries.append(item)
+
+    if group:
+        return {
+            "group": group,
+            "description": QMEDIC_GROUPS[group],
+            "workflow": QMEDIC_WORKFLOW.get(group),
+            "total": len(entries),
+            "entities": entries,
+            "hint": "Use describe_entity(name) for fields, options and links.",
+        }
+    return {
+        "total": len(entries),
+        "groups": {
+            key: {
+                "description": QMEDIC_GROUPS[key],
+                "count": len(entities_in_group(key)),
+            }
+            for key in QMEDIC_GROUPS
+        },
+        "entities": entries,
+        "hint": (
+            "Filter with group=... or query=...; use describe_entity(name) for the "
+            "detail. list_entity_types shows what the instance exposes today."
+        ),
+    }
+
+
+@mcp.tool()
+def describe_entity(entity: str, include_all_fields: bool = False) -> Any:
+    """Describe one entity: mandatory fields, closed options, dates and links.
+
+    Reads `entityDefs.<entity>` from the instance's metadata; when that fails or the
+    entity is not there yet, falls back to the QMedic catalog (and says so in
+    `source`). Use it before `create_record`/`update_record` instead of guessing
+    field names or enum values.
+
+    Args:
+        entity: EspoCRM entity name, e.g. "Atencion", "SignosVitales", "Invoice".
+        include_all_fields: True returns every field, not just mandatory and enum
+            ones. Start compact; ask for all fields only when you need them.
+    """
+    denied = _entity_guard(entity)
+    if denied:
+        return denied
+
+    entry = describe_catalog_entry(entity)
+    fields: dict[str, Any] = {}
+    links: dict[str, str] = {}
+    scope: dict[str, Any] = {}
+    metadata_error: Any = None
+
+    md = _fetch_metadata()
+    if isinstance(md, dict) and "error" in md:
+        metadata_error = md.get("error")
+    else:
+        definition = _navigate(md, f"entityDefs.{entity}")
+        if isinstance(definition, dict):
+            raw_fields = definition.get("fields")
+            fields = raw_fields if isinstance(raw_fields, dict) else {}
+            links = _entity_links(definition)
+        found_scope = _navigate(md, f"scopes.{entity}")
+        scope = found_scope if isinstance(found_scope, dict) else {}
+
+    if not fields and entry is None:
+        return {
+            "error": 404,
+            "message": f"'{entity}' is neither in the instance nor in the QMedic catalog.",
+            "entity": entity,
+            "metadataError": metadata_error,
+            "hint": "Use list_qmedic_entities or list_entity_types to see valid names.",
+        }
+
+    source = "metadata" if fields else "catalog"
+    rules = entry or {}
+    required = [
+        name
+        for name in _required_fields(entity, fields, rules)
+        if name not in REQUIRED_EXEMPT
+    ]
+    if not links:
+        links = dict(rules.get("links") or {})
+
+    selected: dict[str, Any] = {}
+    for name, definition in fields.items():
+        is_interesting = (
+            include_all_fields
+            or name in required
+            or name == "name"
+            or (isinstance(definition, dict)
+                and (definition.get("type") in ("enum", "multiEnum")
+                     or str(definition.get("type")).startswith("datetime")))
+        )
+        if is_interesting:
+            selected[name] = _field_summary(definition)
+
+    if not fields:
+        # Without metadata the sheet comes from the catalog: enums and datetimes are
+        # all it knows, and that is enough to avoid an out-of-range option or an
+        # unconverted local time.
+        for name, options in (rules.get("enums") or {}).items():
+            selected[name] = {"type": "enum", "options": list(options)}
+        for name in rules.get("datetimes") or ():
+            selected[name] = {"type": "datetime"}
+
+    result: dict[str, Any] = {
+        "entity": entity,
+        "label": rules.get("label", entity),
+        "group": rules.get("group"),
+        "source": source,
+        "nameField": "name" if "name" in fields or rules.get("name") else None,
+        "statusField": scope.get("statusField") or rules.get("status"),
+        "stream": bool(scope.get("stream") or rules.get("stream")),
+        "required": required,
+        "links": links,
+        "fields": selected,
+    }
+    if fields and not include_all_fields and len(selected) < len(fields):
+        result["fieldCount"] = len(fields)
+        result["note"] = (
+            f"Showing {len(selected)} of {len(fields)} fields (mandatory, enums, "
+            "datetimes and `name`). Pass include_all_fields=True to see them all."
+        )
+    if source == "catalog":
+        result["note"] = (
+            "The instance metadata did not return this entity; the sheet comes from "
+            "the QMedic catalog and may not reflect later customisations."
+        )
+    if "assignedUser" in fields and fields["assignedUser"].get("required"):
+        result["assignedUserNote"] = (
+            "assignedUser is filled with the API user when omitted "
+            "(ESPO_AUTO_ASSIGN); there is no need to send it."
+        )
+    return result
+
+
+# Links read by the patient summary. Verified against QMedic's metadata: a link the
+# instance does not define is rejected before any request is sent.
+PATIENT_ENTITY = "Contact"
+PATIENT_SECTIONS = (
+    "atenciones",
+    "signosVitales",
+    "recetas",
+    "certificados",
+    "resultados",
+)
+PATIENT_SELECT = (
+    "name,pacienteCedula,pacienteNacimiento,pacienteEdad,pacienteGenero,"
+    "pacienteEstadoCivil,phoneNumber,emailAddress,"
+    "cuentaFacturacionId,cuentaFacturacionName"
+)
+
+
+@mcp.tool()
+def get_patient_summary(
+    contact_id: str,
+    max_items: int = 5,
+    sections: str | None = None,
+) -> Any:
+    """Read a patient's clinical overview in one call (read-only).
+
+    QMedic hangs the whole history off `Contact` («Paciente»), so answering "what is
+    going on with this patient" used to take five separate calls. This one returns
+    the demographic head plus the last records of each section.
+
+    Args:
+        contact_id: ID of the Contact (patient) record.
+        max_items:  Records per section (default 5, capped at 200).
+        sections:   Comma-separated links to read. Default: atenciones,
+                    signosVitales, recetas, certificados, resultados.
+    """
+    denied = _entity_guard(PATIENT_ENTITY)
+    if denied:
+        return denied
+
+    entry = describe_catalog_entry(PATIENT_ENTITY) or {}
+    available = entry.get("links") or {}
+    requested = (
+        [item.strip() for item in sections.split(",") if item.strip()]
+        if sections
+        else list(PATIENT_SECTIONS)
+    )
+    unknown = [name for name in requested if name not in available]
+    if unknown:
+        return {
+            "error": "unknown_link",
+            "message": f"Contact has no such links in QMedic: {', '.join(unknown)}.",
+            "allowed": sorted(available),
+        }
+
+    patient = _read_selected(PATIENT_ENTITY, contact_id, PATIENT_SELECT)
+    if isinstance(patient, dict) and patient.get("error"):
+        # A `select` naming fields this instance does not have must not sink the
+        # summary: retry without `select` and return the full record.
+        patient = _req("GET", f"/{PATIENT_ENTITY}/{contact_id}")
+        if isinstance(patient, dict) and patient.get("error"):
+            return patient
+
+    page_size, note = _page_size(max_items)
+    result: dict[str, Any] = {
+        "patient": patient,
+        "sections": {},
+        "total": len(requested),
+    }
+    for link in requested:
+        section = _req(
+            "GET",
+            f"/{PATIENT_ENTITY}/{contact_id}/{link}",
+            params={"maxSize": page_size, "orderBy": "createdAt", "order": "desc"},
+        )
+        if isinstance(section, dict) and "error" in section:
+            result["sections"][link] = section
+            continue
+        rows = section.get("list") if isinstance(section, dict) else None
+        result["sections"][link] = {
+            "total": section.get("total") if isinstance(section, dict) else None,
+            "list": rows or [],
+        }
+    return _with_page_note(result, note)
 
 
 # ---------------------------------------------------------------------------

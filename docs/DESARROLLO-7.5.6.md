@@ -2,7 +2,7 @@
 
 **Estado:** propuesto
 **Base elegida:** `espocrm-mcp` (`server.py` único, licencia MIT)
-**Nombre del paquete:** `espocrm-mcp7`, versión `1.0.1` (fork que sostiene la línea 7.5.x)
+**Nombre del paquete:** `espocrm-mcp7`, versión `1.1.0` (fork que sostiene la línea 7.5.x)
 **Objetivo:** que el MCP funcione de forma estable contra EspoCRM **7.5.6**, incluidos los módulos licenciados que agregan entidades y campos personalizados.
 **Referencia técnica:** código fuente de `espocrm/espocrm`, etiqueta `7.5.6`, y documentación oficial de la API.
 **Fecha:** 2026-11-06
@@ -657,7 +657,7 @@ curl -H "X-Api-Key: $KEY" "$ESPO/api/v1/Metadata"
 | `test_metadata_non_admin` | `GET /Metadata` sin `key` → 200; con `key` → 403 |
 | `test_licensed_entity` | crear y listar una entidad de un módulo licenciado |
 
-**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p0_6_where_encoding.py`, `tests/test_p1_1_entity_allow.py`, `tests/test_p1_2_entity_rules.py`, `tests/test_p1_3_default_assignee.py`, `tests/test_p1_4_dates.py`, `tests/test_p1_5_pagination.py`, `tests/test_p1_6_select.py`, `tests/test_p1_7_links.py`, `tests/test_p1_8_resilience.py` y `tests/test_p1_9_version.py` — 135 casos. Se ejecutan con `python -m pytest`.
+**Implementado hasta ahora:** `tests/conftest.py` (EspoCRM 7.5.6 simulado con `httpx.MockTransport`), `tests/test_p0_1_unlink_records.py`, `tests/test_p0_2_upload_attachment.py`, `tests/test_p0_3_create_note.py`, `tests/test_p0_4_metadata.py`, `tests/test_p0_5_errors.py`, `tests/test_p0_6_where_encoding.py`, `tests/test_p1_1_entity_allow.py`, `tests/test_p1_2_entity_rules.py`, `tests/test_p1_3_default_assignee.py`, `tests/test_p1_4_dates.py`, `tests/test_p1_5_pagination.py`, `tests/test_p1_6_select.py`, `tests/test_p1_7_links.py`, `tests/test_p1_8_resilience.py`, `tests/test_p1_9_version.py` y `tests/test_p2_1_qmedic_catalog.py` — 165 casos. Se ejecutan con `python -m pytest`.
 
 ### 7.3 Verificación contra una instancia real
 
@@ -716,7 +716,8 @@ Confirma el riesgo de P1-2: en instancias personalizadas las reglas por entidad 
 - [x] P1-7 relaciones `to-one` — probado (`tests/test_p1_7_links.py`) y verificado en vivo; `belongsToParent` resuelto por `parentType`/`parentId`.
 - [x] P1-8 timeout, reintentos y logs — probado (`tests/test_p1_8_resilience.py`).
 - [x] P1-9 detección de versión — probado (`tests/test_p1_9_version.py`) y verificado en vivo.
-- [x] P1-10 empaquetado y `LICENSE` — versiones acotadas, `.env.example`, rueda verificada (solo `server.py`).
+- [x] P1-10 empaquetado y `LICENSE` — versiones acotadas, `.env.example`, rueda verificada (`server.py` y `qmedic_catalog.py`).
+- [x] P2-1 catálogo de entidades de QMedic — probado (`tests/test_p2_1_qmedic_catalog.py`, 30 casos) y regenerable con `--check`.
 - [x] Pruebas de contrato contra 7.5.6 — `scripts/live_acceptance.py` 10/10, más verificaciones puntuales por cada P0/P1.
 - [x] README actualizado con las variables de entorno; las particularidades de 7.5.6 están en §2–§4 y §10.
 - [x] `CHANGELOG.md` y versión `1.0.1` (paquete `espocrm-mcp7`).
@@ -786,7 +787,7 @@ Transporte HTTP opcional: `python server.py --http` (puerto en `MCP_PORT`, 8000 
 
 ```powershell
 python scripts/live_check.py        # solo lectura: versión, permisos y metadata
-python -m pytest                    # 135 casos, sin instancia real
+python -m pytest                    # 165 casos, sin instancia real
 python scripts/live_acceptance.py   # crea y borra registros de prueba
 ```
 
@@ -795,7 +796,7 @@ Resultados esperados:
 | Comprobación | Esperado |
 |---|---|
 | `live_check.py` | `version=7.5.6` en `App/user`; 200 en `Metadata`, `Settings` y `Account` |
-| `pytest` | `135 passed` |
+| `pytest` | `165 passed` |
 | `live_acceptance.py` | `10/10 verificaciones correctas` y los registros `MCPTEST-*` eliminados |
 
 `live_acceptance.py` **escribe** en el CRM: crea una cuenta, un contacto, dos notas y un adjunto con el prefijo `MCPTEST-`, y los borra en un bloque `finally`. Si el proceso se interrumpe, esos registros quedan en el CRM y hay que borrarlos a mano.
@@ -830,9 +831,86 @@ Resultados esperados:
 
 ### 10.8 Limitaciones conocidas
 
-- La rueda publica `server.py` como módulo **global** `server`. Para publicar en PyPI conviene moverlo a un paquete (`espocrm_mcp/`), que es un cambio de estructura pendiente.
+- La rueda publica `server.py` como módulo **global** `server`, junto a `qmedic_catalog` (también global). Para publicar en PyPI conviene moverlos a un paquete (`espocrm_mcp/`), que es un cambio de estructura pendiente.
 - Las lecturas devuelven las fechas en UTC; sólo se normaliza la escritura (§P1-4).
 - `GET /{Entity}/{id}?select=` se ignora en 7.5.6, y `belongsToParent` no se puede listar: ambos casos tienen rodeo implementado y documentado.
+
+---
+
+## 11. Catálogo de entidades de QMedic (P2-1)
+
+### 11.1 El problema
+
+La instancia de QMedic no es «EspoCRM con unos campos extra»: el metadata del
+proyecto define **141 entidades** propias (`Atencion`, `SignosVitales`, `Receta`,
+`RecetaProducto`, `Prscdspnlineitem`, `FhirMap`, `Wischat`…). Las herramientas CRUD
+ya las alcanzaban, porque son genéricas, pero el modelo no tenía forma de saber que
+existían: `list_entity_types` devuelve nombres sin etiqueta, y `get_metadata` cuesta
+unos 979 KB (§P0-4).
+
+Síntoma típico: el asistente inventa `Patient` cuando en QMedic el paciente es
+`Contact` con etiqueta «Paciente», o escribe en `Invoice` sin saber que las líneas
+van en `items` y los impuestos en `InvoiceItem.taxTypes`.
+
+### 11.2 La solución
+
+`qmedic_catalog.py`, un módulo **generado** desde
+`custom/Espo/Custom/Resources` de QMedic:
+
+| Dato | Origen |
+|---|---|
+| Nombre y etiqueta de la entidad | `i18n/es_ES/Global.json` → `scopeNames` (fallback al propio i18n del scope) |
+| Campos obligatorios | `entityDefs.<Entidad>.fields`, descartando `readOnly`, los de infraestructura y los que traen `default` |
+| Opciones cerradas | Campos `enum`/`multiEnum` con `options` estáticas |
+| Campos de fecha y hora | Campos `datetime`/`datetimeOptional` no `readOnly` |
+| Enlaces de dominio | `entityDefs.<Entidad>.links` con `entity`, sin `assignedUser`/`teams`/`createdBy`/`modifiedBy` |
+| `statusField` y `stream` | `scopes/<Entidad>.json` |
+
+Lo único escrito a mano es la **agrupación funcional** (`clinico`, `especialidad`,
+`recetas`, `facturacion`, `inventario`, `contabilidad`, `comercial`,
+`comunicaciones`, `fhir`, `actividad`, `administracion`) y la frase de flujo de cada
+grupo. Todas las afirmaciones de esas frases se verificaron contra los enlaces del
+metadata: por ejemplo, las recetas cuelgan de `Contact.recetas` y **no** de la
+Atención; `Meeting` se llama «Consulta» en esta instancia; y las entidades `Chart*`
+son el plan de cuentas contable, no las curvas de crecimiento.
+
+### 11.3 Herramientas
+
+| Herramienta | Para qué |
+|---|---|
+| `list_qmedic_entities(group, query)` | Mapa del proyecto: grupos con recuento, flujo recomendado y entidades con etiqueta y obligatorios |
+| `describe_entity(entity, include_all_fields)` | Ficha de una entidad: obligatorios, enums, fechas y enlaces. Lee el metadata vivo y, si no está, el catálogo (`source`) |
+| `get_patient_summary(contact_id, max_items, sections)` | Cabeza del paciente más los últimos registros de `atenciones`, `signosVitales`, `recetas`, `certificados` y `resultados` |
+
+`describe_entity` responde en modo compacto (obligatorios, enums, fechas y `name`) y
+dice cuántos campos quedaron fuera; `include_all_fields=True` los devuelve todos.
+
+### 11.4 Prioridad de las fuentes
+
+La instancia sigue siendo la autoridad:
+
+1. `_required_fields` y `_validate_payload` usan `entityDefs` del metadata cuando
+   existe; el catálogo sólo rellena huecos.
+2. `_normalize_dates` usa el tipo del metadata; si no hay metadata, usa los campos
+   `datetime` del catálogo, así que `Atencion.fechaIngreso` se convierte a UTC en
+   lugar de enviarse tal cual.
+3. `describe_entity` marca `source: "metadata"` o `source: "catalog"` para que el
+   llamador sepa cuánto confiar en la ficha.
+
+### 11.5 Regeneración y verificación
+
+```powershell
+python scripts/generate_qmedic_catalog.py            # reescribe qmedic_catalog.py
+python scripts/generate_qmedic_catalog.py --check    # falla si está desactualizado
+```
+
+La ruta por defecto es el repositorio hermano `../qmedic-v4/custom/Espo/Custom/Resources`;
+se cambia con `QMEDIC_METADATA` o `--metadata`. El generador avisa por stderr de
+cualquier entidad que no tenga grupo, para que una entidad nueva no pase inadvertida.
+
+La prueba `test_catalog_is_up_to_date_with_qmedic_metadata` reconstruye el catálogo
+en memoria y lo compara con el archivo versionado; se omite si el metadata de QMedic
+no está en la máquina, así que la suite sigue corriendo sin el proyecto al lado.
 
 ---
 
